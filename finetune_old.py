@@ -300,6 +300,116 @@ def create_memory_efficient_loader(dataset, batch_size, collate_fn, num_proc):
         num_workers=num_proc  # Adjust based on CPU cores
     )
 
+def initialize_new_embeddings(
+    base_embeddings: torch.nn.Parameter,
+    num_new_tokens: int,
+    init_strategy: str = "random",
+    **kwargs
+) -> torch.nn.Parameter:
+    """
+    Initialize embeddings for new tokens using different strategies.
+    
+    Args:
+        base_embeddings: Original embedding weights
+        num_new_tokens: Number of new tokens to add
+        init_strategy: Strategy to use for initialization
+            - "random": Standard normal initialization
+            - "clone": Clone random existing embeddings
+            - "mean": Initialize to mean of base embeddings
+            - "zeros": Initialize to zeros
+    """
+    device = base_embeddings.device
+    dtype = base_embeddings.dtype  # This will be bfloat16
+    embed_dim = base_embeddings.shape[1]
+    
+    if init_strategy == "random":
+        # Initialize directly with correct dtype
+        new_embeddings = torch.empty(num_new_tokens, embed_dim, device=device, dtype=dtype)
+        new_embeddings.normal_()  # In-place normal initialization
+        logger.info(f"New embeddings dtype: {new_embeddings.dtype}, new embeddings shape: {new_embeddings.shape}, new embeddings: {new_embeddings}")
+        # Scale appropriately
+        std = base_embeddings.std().item()
+        new_embeddings.mul_(std)
+    
+    elif init_strategy == "clone":
+        # Randomly select tokens to clone
+        indices = torch.randint(0, len(base_embeddings), (num_new_tokens,))
+        new_embeddings = base_embeddings[indices].clone()
+        # Add small random noise
+        noise = torch.randn_like(new_embeddings) * 0.1
+        new_embeddings += noise
+    
+    elif init_strategy == "mean":
+        # Use mean of base embeddings
+        mean_embedding = base_embeddings.mean(0, keepdim=True)
+        new_embeddings = mean_embedding.repeat(num_new_tokens, 1)
+        # Add small random noise
+        noise = torch.randn_like(new_embeddings) * 0.1
+        new_embeddings += noise
+    
+    elif init_strategy == "zeros":
+        new_embeddings = torch.zeros(num_new_tokens, embed_dim, device=device, dtype=dtype)
+    
+    else:
+        raise ValueError(f"Unknown initialization strategy: {init_strategy}")
+    
+    return new_embeddings
+
+def extend_model_embeddings(model, tokenizer, init_strategy="random"):
+    """Extend model embeddings to match new tokenizer vocabulary."""
+    base_vocab_size = model.get_input_embeddings().weight.shape[0]
+    new_vocab_size = len(tokenizer)
+    
+    if new_vocab_size <= base_vocab_size:
+        # logger.warning("New vocabulary size is not larger than base vocabulary size!")
+        return model
+    
+    num_new_tokens = new_vocab_size - base_vocab_size
+    # logger.info(f"Extending vocabulary from {base_vocab_size} to {new_vocab_size} tokens")
+    
+    # Get the original embeddings
+    old_embeddings = model.get_input_embeddings()
+    old_weights = old_embeddings.weight.data
+    
+    # Initialize new embeddings
+    new_token_embeddings = initialize_new_embeddings(
+        old_weights, 
+        num_new_tokens,
+        init_strategy
+    )
+    
+    # Create new embedding layer
+    new_embeddings = torch.nn.Embedding(new_vocab_size, old_weights.shape[1])
+    new_embeddings.to(dtype=old_weights.dtype, device=old_weights.device)
+    
+    # Copy old embeddings
+    new_embeddings.weight.data[:base_vocab_size] = old_weights
+    new_embeddings.weight.data[base_vocab_size:] = new_token_embeddings
+    
+    # Replace model embeddings
+    model.set_input_embeddings(new_embeddings)
+    
+    # Resize output layer (lm_head) if it exists
+    if hasattr(model, 'lm_head'):
+        old_lm_head = model.lm_head
+        new_lm_head = torch.nn.Linear(
+            old_lm_head.in_features,
+            new_vocab_size,
+            bias=old_lm_head.bias is not None
+        )
+        
+        # Copy old weights
+        new_lm_head.weight.data[:base_vocab_size] = old_lm_head.weight.data
+        new_lm_head.weight.data[base_vocab_size:] = new_token_embeddings  # Initialize with same values
+        
+        if old_lm_head.bias is not None:
+            new_lm_head.bias.data[:base_vocab_size] = old_lm_head.bias.data
+            new_lm_head.bias.data[base_vocab_size:] = 0  # Initialize new biases to 0
+            
+        model.lm_head = new_lm_head
+    
+    return model
+
 def main(args):
 
     if args.output_dir:
@@ -320,7 +430,7 @@ def main(args):
         if args.wandb:
             import wandb
             wandb.login()
-            wandb.init(project=args.wandb, name="Training Run", config=vars(args))
+            wandb.init(project=args.wandb, name=f"Training Run {args.output_dir.split('/')[-1]}", config=vars(args))
 
     accelerator.init_trackers(
         project_name=args.wandb if args.wandb else "efficient-tokenization",
@@ -341,6 +451,7 @@ def main(args):
     #     attn_implementation="sdpa",  # Enables Flash Attention v2
     # )
 
+
     if hasattr(model, "enable_input_require_grads"):  
         model.enable_input_require_grads()  # ✅ Ensures proper gradient tracking
     model.gradient_checkpointing_enable()
@@ -351,15 +462,29 @@ def main(args):
 
     if args.tokenizer_path is not None:
         # load tokenizer from vocab file
+        base_tokenizer = AutoTokenizer.from_pretrained(args.model)
         vocab_file_path = args.tokenizer_path
-        tokenizer = get_tokenizer(vocab_file_path)
+        tokenizer = get_tokenizer(vocab_file_path, old_tokenizer=base_tokenizer)
         logger.info(f"Loaded tokenizer from vocab file: {vocab_file_path}")
+
     else:
         # get original_tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model)
-        tokenizer.pad_token = tokenizer.eos_token
         logger.info(f"Loaded tokenizer from model: {args.model}")
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    logger.info(f"Tokenizer vocab size: {len(tokenizer)}, pad token: {tokenizer.pad_token}, eos token: {tokenizer.eos_token}, pad_token_id: {tokenizer.pad_token_id}")
+
+    if args.embedding_init_strategy is not None:
+        # Extend model embeddings
+        logger.info(f"Extending model embeddings with strategy: {args.embedding_init_strategy}")
+        model = extend_model_embeddings(
+            model, 
+            tokenizer, 
+            init_strategy=args.embedding_init_strategy
+        )
 
     ds = load_from_disk(args.dataset)
     # Split the dataset into train (90%) and validation (10%)
@@ -414,11 +539,32 @@ def main(args):
 
     logger.info(f"Initial learning rate from optimizer: {optim.param_groups[0]['lr']}")
 
-    max_steps = max(args.max_train_steps, train_batches//(gradient_accumulation_steps * accelerator.num_processes))
+
+
+    if args.max_train_steps > 0:
+        max_train_steps = args.max_train_steps
+    else:
+        max_train_steps = train_batches//(gradient_accumulation_steps * accelerator.num_processes)
+
+    # these calculations are done AFTER the accelerator is initialized
+    num_batches_per_device_per_epoch = len(train_loader)
+    grad_updates_per_device_per_epoch = math.ceil(num_batches_per_device_per_epoch / gradient_accumulation_steps)
+
+    epoch_remainder_on_device = num_batches_per_device_per_epoch % gradient_accumulation_steps
+    epoch_remainder_on_device = epoch_remainder_on_device if epoch_remainder_on_device != 0 else gradient_accumulation_steps
+
+    if num_epochs > 0:
+        total_gradient_updates = min(max_train_steps, grad_updates_per_device_per_epoch * num_epochs * accelerator.num_processes)
+        total_gradient_updates_per_device = min(math.ceil(max_train_steps // accelerator.num_processes), grad_updates_per_device_per_epoch * num_epochs)
+    else:
+        total_gradient_updates = max_train_steps
+        total_gradient_updates_per_device = math.ceil(max_train_steps // accelerator.num_processes)
+
+
     if args.lr_schedule == "linear":
         scheduler = get_linear_schedule_with_warmup(
             optim, 
-            num_training_steps=max_steps,
+            num_training_steps=max_train_steps,
             num_warmup_steps=args.warmup_steps
         )
     elif args.lr_schedule == "constant":
@@ -460,21 +606,7 @@ def main(args):
             batch = {k: v.cpu() for k, v in batch.items()}
             return batch, training_iterator, epoch
 
-    # these calculations are done AFTER the accelerator is initialized
-    num_batches_per_device_per_epoch = len(train_loader)
-    grad_updates_per_device_per_epoch = math.ceil(num_batches_per_device_per_epoch / gradient_accumulation_steps)
-    if num_epochs > 0:
-        total_gradient_updates = min(args.max_train_steps, grad_updates_per_device_per_epoch * num_epochs * accelerator.num_processes)
-        total_gradient_updates_per_device = min(math.ceil(args.max_train_steps // accelerator.num_processes), grad_updates_per_device_per_epoch * num_epochs)
-    else:
-        total_gradient_updates = args.max_train_steps
-        total_gradient_updates_per_device = math.ceil(args.max_train_steps // accelerator.num_processes)
-
-
-    epoch_remainder_on_device = num_batches_per_device_per_epoch % gradient_accumulation_steps
-    epoch_remainder_on_device = epoch_remainder_on_device if epoch_remainder_on_device != 0 else gradient_accumulation_steps
-
-    logger.info(f"max train steps {args.max_train_steps} ({math.ceil(args.max_train_steps / accelerator.num_processes)} per device)")
+    logger.info(f"max train steps {max_train_steps} ({math.ceil(max_train_steps / accelerator.num_processes)} per device)")
     logger.info(f"total gradient updates {total_gradient_updates} ({total_gradient_updates_per_device} per device)")
     logger.info(f"grad updates per epoch {grad_updates_per_device_per_epoch * accelerator.num_processes} ({grad_updates_per_device_per_epoch} per device)")
     logger.info(f"train samples: {train_samples}, batches: {train_batches}, and tokens: {train_loader_token_count}")
@@ -485,7 +617,8 @@ def main(args):
     logger.info(f"per device batch size {args.batch_size}")
     logger.info(f"num_processes {accelerator.num_processes}")
     logger.info(f"effective batch size {total_batch_size}")
-    logger.info(f"learning rate {args.learning_rate}, warmup steps {args.warmup_steps}, schedule_max_steps {max_steps}, split_scheduler {split_scheduler}")
+    logger.info(f"learning rate {args.learning_rate}, warmup steps {args.warmup_steps}, schedule_max_steps {max_train_steps}, split_scheduler {split_scheduler}")
+    logger.info(f"checkpointing steps {args.checkpointing_steps}")
 
     # if not args.lora:
     #     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
@@ -528,7 +661,7 @@ def main(args):
     if args.save_only:
         can_train = False
 
-    logger.info(f"Training for {args.max_train_steps} steps")
+    logger.info(f"Training for {max_train_steps} steps")
     use_progress_bar = True
     progress_bar = tqdm(
         range(total_gradient_updates),
@@ -696,8 +829,8 @@ def main(args):
 
                 # checkpointing
                 if isinstance(args.checkpointing_steps, int) and update_step > 0:
-                    # TODO THIS DOESNT WORK
                     if update_step % args.checkpointing_steps == 0:
+                        logger.info(f"Checkpointing step {update_step}")
                         output_dir = f"step_{update_step}"
                         if args.output_dir is not None:
                             output_dir = os.path.join(
@@ -765,9 +898,13 @@ def main(args):
 
         save_model = True
         if save_model:
+            output_dir = f"final_model"
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+            accelerator.save_state(output_dir)
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.save_pretrained(
-                f"{args.output_dir}",
+                output_dir,
                 is_main_process=accelerator.is_main_process,
                 save_function=accelerator.save,
                 # state_dict=state_dict,
@@ -810,7 +947,7 @@ if __name__ == "__main__":
     args.add_argument("--output-dir", type=str, required=True)
     args.add_argument("--wandb", type=str)
     args.add_argument("--seed", type=int, default=42)
-    args.add_argument("--max-train-steps", type=int, default=20)
+    args.add_argument("--max-train-steps", type=int, default=-1)
     args.add_argument("--num-epochs", type=int, default=-1)
     args.add_argument("--warmup-steps", type=int, default=10)
     args.add_argument("--learning-rate", type=float, default=2e-5)
@@ -850,6 +987,10 @@ if __name__ == "__main__":
                      help="Automatically find optimal batch size")
     args.add_argument("--cpu-offload", action="store_true",
                      help="Enable CPU offloading for optimizer states")
+    args.add_argument("--embedding-init-strategy", type=str,
+                     choices=["random", "clone", "mean", "zeros"],
+                     default="random",
+                     help="Strategy for initializing new token embeddings")
     main(args.parse_args())
 
     # TODO consider training params:

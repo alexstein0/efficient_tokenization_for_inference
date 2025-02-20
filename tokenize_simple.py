@@ -119,8 +119,28 @@ def load_pretokenizer(pre_tok_name: str):
     pre_tok = pre_tokenizers.Sequence(pre_tok_list)
     return pre_tok
 
-def load_tokenizer_from_file(vocab_file_path: str):
-    tok = PreTrainedTokenizerFast(vocab_file=vocab_file_path)
+def load_tokenizer_from_file(vocab_file_path: str, base_tokenizer: AutoTokenizer = None):
+    if base_tokenizer is not None:
+        tok = PreTrainedTokenizerFast(
+            vocab_file=vocab_file_path,
+            bos_token=base_tokenizer.bos_token,
+            eos_token=base_tokenizer.eos_token,
+            unk_token=base_tokenizer.unk_token,
+            sep_token=base_tokenizer.sep_token,
+            pad_token=base_tokenizer.pad_token,
+            cls_token=base_tokenizer.cls_token,
+            mask_token=base_tokenizer.mask_token,
+            additional_special_tokens=base_tokenizer.additional_special_tokens,
+            # Copy other important attributes
+            clean_up_tokenization_spaces=base_tokenizer.clean_up_tokenization_spaces,
+            model_max_length=base_tokenizer.model_max_length,
+            padding_side=base_tokenizer.padding_side,
+            truncation_side=base_tokenizer.truncation_side
+            )
+        # tok.special_tokens_map = base_tokenizer.special_tokens_map.copy()
+
+    else:
+        tok = PreTrainedTokenizerFast(vocab_file=vocab_file_path)
     return tok
 
 def my_tokenize(ds, tok, batch_size, threads):
@@ -172,8 +192,8 @@ def get_tokenized_data(tokenizer_path: str, dataset_path: str, pre_tok_name: Opt
 
     return tok, ds, tokenized_dataset
 
-def get_tokenizer(tokenizer_path: str, pre_tok_name: str = None):
-    tok = load_tokenizer_from_file(tokenizer_path)
+def get_tokenizer(tokenizer_path: str, pre_tok_name: str = None, old_tokenizer: AutoTokenizer = None):
+    tok = load_tokenizer_from_file(tokenizer_path, old_tokenizer)
     if pre_tok_name is not None:
         tok = apply_pretokenizer(tok, pre_tok_name)
     return tok

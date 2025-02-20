@@ -41,6 +41,7 @@ def main(args):
     # pre_tok_name = "empty" # TODO make configurable
     # tokenizer_path_old = f"/cmlscratch/astein0/LLM-pretraining/LLM-pretraining-tokenization/tokenizers/Llama-3.2-tokenizer-genqa-{ext}-{pre_tok_name}-start"
     # tokenizer_file_old = "new_mergeable_ranks_2000.model"
+    #--tokenizer-path /cmlscratch/astein0/LLM-pretraining/LLM-pretraining-tokenization/tokenizers/Llama-3.2-tokenizer-genqa-math-empty-start/new_mergeable_ranks_2000.model
     # vocab_file_path = f"{tokenizer_path_old}/{tokenizer_file_old}"
     # dataset_path = f"/fs/cml-projects/llm-pretraining/datasets/raw/{raw_data_name}/{ext}" # TODO make configurable
     # dataset_path = "/cmlscratch/astein0/efficient_tokenization_for_inference/datasets/test"
