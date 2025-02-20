@@ -325,27 +325,26 @@ def initialize_new_embeddings(
     if init_strategy == "random":
         # Initialize directly with correct dtype
         new_embeddings = torch.empty(num_new_tokens, embed_dim, device=device, dtype=dtype)
-        new_embeddings.normal_()  # In-place normal initialization
-        logger.info(f"New embeddings dtype: {new_embeddings.dtype}, new embeddings shape: {new_embeddings.shape}, new embeddings: {new_embeddings}")
-        # Scale appropriately
-        std = base_embeddings.std().item()
-        new_embeddings.mul_(std)
+        with torch.cuda.amp.autocast(dtype=dtype):  # Ensure operations maintain dtype
+            new_embeddings.normal_()
+            std = base_embeddings.std().item()
+            new_embeddings.mul_(std)
     
     elif init_strategy == "clone":
         # Randomly select tokens to clone
         indices = torch.randint(0, len(base_embeddings), (num_new_tokens,))
         new_embeddings = base_embeddings[indices].clone()
-        # Add small random noise
-        noise = torch.randn_like(new_embeddings) * 0.1
-        new_embeddings += noise
+        with torch.cuda.amp.autocast(dtype=dtype):
+            noise = torch.randn_like(new_embeddings) * 0.1
+            new_embeddings += noise
     
     elif init_strategy == "mean":
         # Use mean of base embeddings
         mean_embedding = base_embeddings.mean(0, keepdim=True)
         new_embeddings = mean_embedding.repeat(num_new_tokens, 1)
-        # Add small random noise
-        noise = torch.randn_like(new_embeddings) * 0.1
-        new_embeddings += noise
+        with torch.cuda.amp.autocast(dtype=dtype):
+            noise = torch.randn_like(new_embeddings) * 0.1
+            new_embeddings += noise
     
     elif init_strategy == "zeros":
         new_embeddings = torch.zeros(num_new_tokens, embed_dim, device=device, dtype=dtype)
@@ -361,11 +360,11 @@ def extend_model_embeddings(model, tokenizer, init_strategy="random"):
     new_vocab_size = len(tokenizer)
     
     if new_vocab_size <= base_vocab_size:
-        # logger.warning("New vocabulary size is not larger than base vocabulary size!")
+        logger.warning("New vocabulary size is not larger than base vocabulary size!")
         return model
     
     num_new_tokens = new_vocab_size - base_vocab_size
-    # logger.info(f"Extending vocabulary from {base_vocab_size} to {new_vocab_size} tokens")
+    logger.info(f"Extending vocabulary from {base_vocab_size} to {new_vocab_size} tokens")
     
     # Get the original embeddings
     old_embeddings = model.get_input_embeddings()
@@ -378,9 +377,13 @@ def extend_model_embeddings(model, tokenizer, init_strategy="random"):
         init_strategy
     )
     
-    # Create new embedding layer
-    new_embeddings = torch.nn.Embedding(new_vocab_size, old_weights.shape[1])
-    new_embeddings.to(dtype=old_weights.dtype, device=old_weights.device)
+    # Create new embedding layer with correct dtype
+    new_embeddings = torch.nn.Embedding(
+        new_vocab_size, 
+        old_weights.shape[1],
+        dtype=old_weights.dtype,
+        device=old_weights.device
+    )
     
     # Copy old embeddings
     new_embeddings.weight.data[:base_vocab_size] = old_weights
@@ -389,22 +392,27 @@ def extend_model_embeddings(model, tokenizer, init_strategy="random"):
     # Replace model embeddings
     model.set_input_embeddings(new_embeddings)
     
+    # Update the model's config
+    model.config.vocab_size = new_vocab_size
+    
     # Resize output layer (lm_head) if it exists
     if hasattr(model, 'lm_head'):
         old_lm_head = model.lm_head
         new_lm_head = torch.nn.Linear(
             old_lm_head.in_features,
             new_vocab_size,
-            bias=old_lm_head.bias is not None
+            bias=old_lm_head.bias is not None,
+            dtype=old_lm_head.weight.dtype,
+            device=old_lm_head.weight.device
         )
         
         # Copy old weights
         new_lm_head.weight.data[:base_vocab_size] = old_lm_head.weight.data
-        new_lm_head.weight.data[base_vocab_size:] = new_token_embeddings  # Initialize with same values
+        new_lm_head.weight.data[base_vocab_size:] = new_token_embeddings
         
         if old_lm_head.bias is not None:
             new_lm_head.bias.data[:base_vocab_size] = old_lm_head.bias.data
-            new_lm_head.bias.data[base_vocab_size:] = 0  # Initialize new biases to 0
+            new_lm_head.bias.data[base_vocab_size:] = 0
             
         model.lm_head = new_lm_head
     
@@ -453,7 +461,7 @@ def main(args):
 
 
     if hasattr(model, "enable_input_require_grads"):  
-        model.enable_input_require_grads()  # ✅ Ensures proper gradient tracking
+        model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
     logger.info("Loading model and tokenizer...")
 
@@ -811,6 +819,7 @@ def main(args):
                 }
                 metrics_dict = {f"train_{k}": v for k, v in metrics_dict.items()}
                 metrics_dict["step"] = update_step
+                metrics_dict["epoch"] = epoch
                 loss_log = {
                     "loss": avg_loss,
                 }
