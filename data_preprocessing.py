@@ -1,6 +1,6 @@
 import logging
 
-from tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer
+from tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer, create_translation_dataset
 from datasets import load_from_disk
 from transformers import AutoTokenizer
 import copy
@@ -31,36 +31,29 @@ def preprocess_data(ds, args):
     else:
         raise ValueError(f"Unsupported raw data name: {args.raw_data_name}")
     return ds
-
-
+    
 def main(args):
     logger = setup_logging()
-
-    # raw_data_name = "genqa" # TODO make configurable
-    # ext = "math" # TODO make configurable
-    # pre_tok_name = "empty" # TODO make configurable
-    # tokenizer_path_old = f"/cmlscratch/astein0/LLM-pretraining/LLM-pretraining-tokenization/tokenizers/Llama-3.2-tokenizer-genqa-{ext}-{pre_tok_name}-start"
-    # tokenizer_file_old = "new_mergeable_ranks_2000.model"
-    #--tokenizer-path /cmlscratch/astein0/LLM-pretraining/LLM-pretraining-tokenization/tokenizers/Llama-3.2-tokenizer-genqa-math-empty-start/new_mergeable_ranks_2000.model
-    # vocab_file_path = f"{tokenizer_path_old}/{tokenizer_file_old}"
-    # dataset_path = f"/fs/cml-projects/llm-pretraining/datasets/raw/{raw_data_name}/{ext}" # TODO make configurable
-    # dataset_path = "/cmlscratch/astein0/efficient_tokenization_for_inference/datasets/test"
-    # max_seq_length = 2048 # TODO make configurable and usable
-    # save_path = os.path.join(args.save_dataset_path, f"{raw_data_name}-{ext}-{pre_tok_name}-start")
-
     # Get tokenizer
     logger.info(f"Getting tokenizer")
 
+    base_tokenizer = None
     if args.tokenizer_path is not None:
         # load tokenizer from vocab file
-        vocab_file_path = args.tokenizer_path
-        tokenizer = get_tokenizer(vocab_file_path, args.pretokenizer_name)
-        logger.info(f"Loaded tokenizer from vocab file: {vocab_file_path}")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+            logger.info(f"Loaded HF tokenizer from vocab file: {args.tokenizer_path}")
+        except:
+            base_tokenizer = AutoTokenizer.from_pretrained(args.model)
+            vocab_file_path = args.tokenizer_path
+            pre_tok_name = args.pre_tok_name
+            tokenizer = get_tokenizer(vocab_file_path, pre_tok_name=pre_tok_name, old_tokenizer=base_tokenizer)
+            logger.info(f"Loaded tokenizer from .model file: {vocab_file_path} and pre_tok_name: {pre_tok_name}")
     else:
         # get original_tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model)
-        tokenizer.pad_token = tokenizer.eos_token
         logger.info(f"Loaded tokenizer from model: {args.model}")
+
 
     # Get Dataset
     # the data must be fully preprocessed and ready to be tokenized with the tokenized text in "text" column
@@ -70,8 +63,13 @@ def main(args):
     ds = load_from_disk(dataset_path)
     changed_dataset = False
 
-    # this is the only thing that is dataset specific
+    # this block is the only thing that is dataset specific
     ds = preprocess_data(ds, args)
+    if args.task == "translation":
+        if base_tokenizer is None:
+            base_tokenizer = AutoTokenizer.from_pretrained(args.model)
+        ds = create_translation_dataset(ds, base_tokenizer, tokenizer, args.cpu_batch_size, args.num_proc)
+
 
     # tokenize dataset
     if args.force_tokenize or "input_ids" not in ds.column_names:
@@ -173,4 +171,5 @@ if __name__ == "__main__":
     args.add_argument("--tokenizer-path", type=str)
     args.add_argument("--pretokenizer-name", type=str)
     args.add_argument("--force-tokenize", action="store_true")
+    args.add_argument("--task", type=str, default="default")
     main(args.parse_args())
