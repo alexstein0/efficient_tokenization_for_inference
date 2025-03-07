@@ -1,6 +1,6 @@
 import logging
 
-from tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer, create_translation_dataset
+from efficient_tokenization.tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer, create_translation_dataset
 from datasets import load_from_disk
 from transformers import AutoTokenizer
 import copy

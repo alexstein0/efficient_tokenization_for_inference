@@ -7,22 +7,12 @@ import psutil
 from datasets import load_dataset, load_from_disk
 import datasets
 datasets.disable_caching()
-
+from chat_templating import apply_chat_template_to_repeat, get_llama_base_chat_template, get_llama_instruct_chat_template
 import os
 import copy
 
 from datasets.utils.logging import disable_progress_bar
 disable_progress_bar()
-
-
-# logging.basicConfig(level=logging.INFO)
-
-# batch_size = 500
-
-# try:
-#     threads = min(psutil.cpu_count(logical=False), len(psutil.Process().cpu_affinity()))
-# except:
-#     threads = os.cpu_count()
 
 
 def extract_genqa(example_list: List[List[Dict[str, str]]], track_role: bool = False) -> List[List[str]]:
@@ -379,127 +369,46 @@ def create_translation_dataset(ds: datasets.Dataset, base_tokenizer: AutoTokeniz
     
     return tokenized_dataset
 
-def llama_chat_template(system_msg: str, user_msg: str, assistant_msg: str) -> str:
-    """
-    Builds a single-turn conversation using Llama v2 style chat format.
-    For multi-turn, you'd append more [INST] blocks, but here's the simplest approach:
-    
-    <s>[INST] <<SYS>>
-    {system_msg}
-    <</SYS>>
-    {user_msg} [/INST]
-    {assistant_msg}</s>
-    """
-    return (
-        f"<s>[INST] <<SYS>>\n{system_msg}\n<</SYS>>\n{user_msg} [/INST]"
-        + assistant_msg
-        + "</s>"
-    )
-
-def llama_chat_template(system_msg, user_msg, assistant_msg) -> str:
-    return (
-        f"<s>[INST] <<SYS>>\n{system_msg}\n<</SYS>>\n{user_msg} [/INST]"
-        + assistant_msg
-        + "</s>"
-    )
-
-def create_translation_dataset_with_template(
-    ds: datasets.Dataset,
-    base_tokenizer: AutoTokenizer,
-    tokenizer_input: AutoTokenizer | str,
-    batch_size: int,
-    threads: int
-) -> datasets.Dataset:
-# TODO THIS ISNT RIGHT AT THE MOMENT, DOESNT USE NEW TOKENIZER
-    
-    # 1) Define default system message & user instructions
-    system_msg = "You are a helpful assistant."
-    # The user prompt (for example):
-    # "Repeat the following text: {text1}"
-    # The assistant must respond with text2
-
+def create_translation_dataset_with_template(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int) -> datasets.Dataset:
+    chat_template = get_llama_base_chat_template()
     def tokenize_function(examples):
-        row_texts = list(examples["text"])  # e.g., "some text we want repeated"
+        global extended_tokenizer
+        messages = [
+            [{
+                "content": x
+            }]  for x in examples["text"]
+        ]
+        tokenized_texts = apply_chat_template_to_repeat(
+            base_tokenizer=base_tokenizer,
+            second_tokenizer=extended_tokenizer,
+            chat_template=chat_template,
+            conversation=messages,
+            return_assistant_tokens_mask=True,
+            add_generation_prompt=True,
+            return_dict=True,
+        )
+        return tokenized_texts
 
-        combined_text = []
-        combined_input_ids = []
-        combined_attention_mask = []
-        combined_loss_mask = []
-
-        for i, text_i in enumerate(row_texts):
-            # In your original code, you do "Repeat the following text: {text_i}"
-            # We want the assistant to answer with text_i again
-            user_msg = f"Repeat the following text: {text_i}"
-            assistant_msg = text_i  # The actual repeated text
-
-            # 2) Build the final chat string
-            chat_str = llama_chat_template(
-                system_msg=system_msg,
-                user_msg=user_msg,
-                assistant_msg=assistant_msg
-            )
-
-            # 3) Tokenize with base_tokenizer
-            tokenized = base_tokenizer(chat_str, add_special_tokens=False)
-
-            # "chat_str" is just for debugging if needed
-            combined_text.append(chat_str)
-            input_ids = tokenized["input_ids"]
-            attention_mask = tokenized["attention_mask"]
-
-            # 4) Build a loss mask
-            #   We typically want to apply loss only on "assistant" portion:
-            #   everything AFTER '[/INST]' is the assistant
-            # Let's find the index of '[/INST]' if it exists:
-            with base_tokenizer.as_target_tokenizer():
-                end_inst_str = base_tokenizer("[/INST]", add_special_tokens=False)["input_ids"]
-            # We can search for that subsequence, or do a simpler approach:
-            #   Let's just find the first occurrence of '[/INST]' tokens in input_ids.
-            #   Then we set mask=0 for tokens up to that index, mask=1 after.
-
-            end_inst_idx = None
-            for idx in range(len(input_ids) - len(end_inst_str) + 1):
-                if input_ids[idx : idx + len(end_inst_str)] == end_inst_str:
-                    end_inst_idx = idx + len(end_inst_str)
-                    break
-
-            if end_inst_idx is None:
-                # if not found, default to no masked portion
-                mask_loss = [0] * len(input_ids)
-            else:
-                mask_loss = [0] * end_inst_idx + [1] * (len(input_ids) - end_inst_idx)
-
-            combined_input_ids.append(input_ids)
-            combined_attention_mask.append(attention_mask)
-            combined_loss_mask.append(mask_loss)
-
-        return {
-            "text": combined_text,  # purely for reference
-            "input_ids": combined_input_ids,
-            "attention_mask": combined_attention_mask,
-            "labels": combined_input_ids,  # Typical Causal LM approach
-            "loss_mask": combined_loss_mask,
-        }
-
-    # 5) Possibly init extended_tokenizer if needed
     if isinstance(tokenizer_input, str):
+        # Initialize the tokenizer before mapping
         init_tokenizer(tokenizer_input)
     else:
+        # When using an object, make it available globally
         global extended_tokenizer
         extended_tokenizer = tokenizer_input
-
-    # 6) Map over the dataset
+        
     tokenized_dataset = ds.map(
         tokenize_function,
         batched=True,
         batch_size=batch_size,
         num_proc=threads,
         remove_columns=ds.column_names,
-        desc="Creating translation dataset w/ Llama Chat Template",
+        desc="Creating translation dataset",
         cache_file_name=None
     )
-
+    
     return tokenized_dataset
+
 
 if __name__ == "__main__":
 

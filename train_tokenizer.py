@@ -28,7 +28,7 @@ from tokenizers import pre_tokenizers, Regex
 
 import argparse
 
-from tokenize_simple import get_tokenizer, load_pretokenizer, pretokenizer_to_config
+from efficient_tokenization.tokenize_simple import get_tokenizer, load_pretokenizer, pretokenizer_to_config
 
 logger = logging.getLogger(__name__)
 

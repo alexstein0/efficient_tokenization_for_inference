@@ -29,7 +29,7 @@ accelerate launch --num_processes 8 -m lm_eval \
     --log_samples \
     --cache_requests true \
     --show_config \
-    --use_cache lm-evaluation-harness-cache
+    --use_cache lm-evaluation-harness-cache/
 
 # accelerate launch --num_processes 8 -m lm_eval \
 #     --model_args "pretrained=output/batch_256_checkpointing/final_model,tokenizer=meta-llama/Llama-3.2-1B,parallelize=True,do_sample=True,temperature=0.7,top_p=3" \

@@ -1,5 +1,6 @@
 import argparse
 import torch
+import torch.nn as nn
 import os
 from datasets import load_dataset, load_from_disk, DatasetDict
 from datetime import timedelta
@@ -15,19 +16,22 @@ import torch.distributed as dist
 import csv
 import shutil
 import math
-from typing import Any, Dict
+from typing import Any, Dict, List, Union
 
 from accelerate.logging import get_logger
 import logging
 import json
 
 import psutil
-from tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer
-from extend_embeddings import extend_model_embeddings, initialize_new_embeddings, get_new_embedding_params, get_new_embeddings_grads
+from efficient_tokenization.tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer
+from efficient_tokenization.extend_embeddings import extend_model_embeddings, initialize_new_embeddings, get_new_embedding_params, get_new_embeddings_grads, unfreeze_model, freeze_model_except_embeddings, freeze_old_embeddings
+from efficient_tokenization.data_utils import MyPaddingCollator, MyPaddingCollatorWithLossMask
+from efficient_tokenization.utils import setup_logging, check_disk_space
 
 from lm_eval import evaluator, tasks, utils, models
 from lm_eval.tasks import TaskManager
 
+from dataclasses import dataclass
 
 from liger_kernel.transformers import AutoLigerKernelForCausalLM, LigerCrossEntropyLoss
 
@@ -35,26 +39,6 @@ import gc
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-def is_distributed():
-    return torch.distributed.is_initialized() if torch.distributed.is_available() else False
-
-
-def setup_logging(log_level=logging.INFO):
-    """Setup global logging configuration"""
-    # Set up basic configuration first
-    logging.basicConfig(
-        format='%(asctime)s - %(message)s',
-        level=log_level,
-        force=True  # This ensures we override any existing configuration
-    )
-    if AcceleratorState().initialized:
-        ll = logging.getLevelName(log_level)
-        logger = get_logger(__name__)
-        logger.setLevel(ll)
-    else:
-        logger = logging.getLogger(__name__)  # if you want to see for all ranks
-    
-    return logger
 
 def find_all_linear_names(model):
     lora_module_names = set()
@@ -69,10 +53,10 @@ def find_all_linear_names(model):
     return list(lora_module_names)
 
 
-def initialize_distributed():
-    if not dist.is_initialized():
-        logger.info("initializing process group")
-        dist.init_process_group(backend='nccl')  # or 'gloo' depending on your setup
+# def initialize_distributed():
+#     if not dist.is_initialized():
+#         logger.info("initializing process group")
+#         dist.init_process_group(backend='nccl')  # or 'gloo' depending on your setup
 
 
 def log_loss(metrics_dict, output_dir, filename="loss_log.csv"):
@@ -229,258 +213,51 @@ def evaluate(model, eval_loader, accelerator, num_steps=100, eval_config: Dict =
     return results
 
 
-def get_directory_size(directory):
-    """Calculate the total size of a directory in bytes."""
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(directory):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            total += os.path.getsize(fp)
-    return total
 
 
-def format_size(bytes):
-    """Convert bytes to human readable format."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes < 1024:
-            return f"{bytes:.2f} {unit}"
-        bytes /= 1024
-
-def check_disk_space(directory, required_space_gb=10):
-    """
-    Check if there's enough disk space to save the model.
-    
-    Args:
-        directory: Directory where model will be saved
-        accelerator: Accelerator instance for distributed training logging
-        required_space_gb: Required free space in GB (default 10GB)
-    
-    Returns:
-        bool: True if enough space available, False otherwise
-    """
-    try:
-        # Get free space in bytes
-        free_space = shutil.disk_usage(directory).free
-        required_space = required_space_gb * 1024 * 1024 * 1024  # Convert GB to bytes
-        
-        # If directory exists, add its current size to required space
-        if os.path.exists(directory):
-            required_space += get_directory_size(directory)
-        
-        if free_space < required_space:
-            logger.warning(f"Warning: Not enough disk space!")
-            logger.warning(f"Available: {format_size(free_space)}")
-            logger.warning(f"Required: {format_size(required_space)}")
-            return False
-        
-        logger.debug(f"Sufficient disk space available:")
-        logger.debug(f"Free space: {format_size(free_space)}")
-        logger.debug(f"Required space: {format_size(required_space)}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error checking disk space: {str(e)}")
-        return False
-
-from dataclasses import dataclass
-from typing import Dict, List, Union
-import torch
-import torch.nn as nn
-
-# overwrite the forward method of the model
-def my_custom_forward(self, input_ids, attention_mask=None, labels=None, loss_mask=None, **kwargs):
-    # 1) Call original forward, which we stored as _old_forward
-    outputs = self._old_forward(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        labels=labels,
-        return_dict=True,          # Force returning a ModelOutput
-        output_attentions=False,   # Optional
-        output_hidden_states=False, # Optional
-        **kwargs
-    )
-    # outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
-    print(outputs)
-    if labels is not None and loss_mask is not None:
-        # Get the original loss
-        shift_logits = outputs.logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        shift_loss_mask = loss_mask[..., 1:].contiguous()
-        
-        # Calculate loss only where loss_mask is 1
-        loss_fct = nn.functional.cross_entropy(reduction='none')
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        loss = loss.view(shift_labels.shape)
-        
-        # Apply mask and average
-        masked_loss = (loss * shift_loss_mask).sum() / shift_loss_mask.sum()
-        outputs.loss = masked_loss
-
-        # Calculate loss for new tokens if applicable
-        if "new_token_start_index" in kwargs:
-            new_token_start_index = kwargs["new_token_start_index"]
-            new_token_mask = (shift_labels > new_token_start_index).float()
-            if new_token_mask.sum() > 0:
-                masked_loss_new_tokens = (loss * new_token_mask).sum() / new_token_mask.sum()
-            else:
-                masked_loss_new_tokens = torch.tensor(0.0, device=loss.device)
-            outputs.loss_new_tokens = masked_loss_new_tokens
-        else:
-            outputs.loss_new_tokens = torch.tensor(0.0, device=loss.device)
-            
-    return outputs
-
-@dataclass
-class MyPaddingCollator:
-    """
-    Data collator that will dynamically pad the inputs received.
-    """
-    tokenizer: Any
-    max_length: int = None
-    padding: bool = True
-    
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # Extract all input_ids, attention_masks, and labels
-        input_ids = [f["input_ids"] for f in features]
-        attention_mask = [f["attention_mask"] for f in features]
-        labels = [f["labels"] for f in features]
-        
-        # Convert to tensors if they aren't already
-        if isinstance(input_ids[0], list):
-            input_ids = [torch.tensor(x, dtype=torch.long) for x in input_ids]
-        if isinstance(attention_mask[0], list):
-            attention_mask = [torch.tensor(x, dtype=torch.long) for x in attention_mask]
-        if isinstance(labels[0], list):
-            labels = [torch.tensor(x, dtype=torch.long) for x in labels]
-        
-        # Compute padding
-        max_length_tokens = max(x.size(0) for x in input_ids)
-        if self.max_length is None:
-            max_length = max_length_tokens
-        else:
-            max_length = max(max_length_tokens, self.max_length)
-        
-        # Pad all tensors to max_length
-        padded_input_ids = []
-        padded_attention_mask = []
-        padded_labels = []
-        
-        for ids, mask, lab in zip(input_ids, attention_mask, labels):
-            # Calculate padding length
-            pad_len = max_length - ids.size(0)
-            
-            if pad_len > 0:
-                # Pad input_ids
-                padded_input_ids.append(
-                    torch.cat([ids, torch.ones(pad_len, dtype=torch.long) * self.tokenizer.pad_token_id])
-                )
-                # Pad attention_mask
-                padded_attention_mask.append(
-                    torch.cat([mask, torch.zeros(pad_len, dtype=torch.long)])
-                )
-                # Pad labels
-                padded_labels.append(
-                    torch.cat([lab, torch.ones(pad_len, dtype=torch.long) * -100])
-                )
-            else:
-                padded_input_ids.append(ids)
-                padded_attention_mask.append(mask)
-                padded_labels.append(lab)
-        
-        # Stack all tensors
-        batch = {
-            "input_ids": torch.stack(padded_input_ids),
-            "attention_mask": torch.stack(padded_attention_mask),
-            "labels": torch.stack(padded_labels)
-        }
-        
-        return batch
+def calc_loss_with_grad(model, input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor = None):
+    pass
 
 
-@dataclass
-class MyPaddingCollatorWithLossMask:
-    """
-    Data collator that will dynamically pad the inputs received.
-    """
-    tokenizer: Any
-    max_length: int = None
-    padding: bool = True
-    
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # Extract all input_ids, attention_masks, and labels
-        input_ids = [f["input_ids"] for f in features]
-        attention_mask = [f["attention_mask"] for f in features]
-        labels = [f["labels"] for f in features]
-        loss_mask = [f["loss_mask"] for f in features]
+@torch.no_grad()
+def calc_loss_without_grad(model, input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor = None):
+    pass
 
-        # Convert to tensors if they aren't already
-        if isinstance(input_ids[0], list):
-            input_ids = [torch.tensor(x, dtype=torch.long) for x in input_ids]
-        if isinstance(attention_mask[0], list):
-            attention_mask = [torch.tensor(x, dtype=torch.long) for x in attention_mask]
-        if isinstance(labels[0], list):
-            labels = [torch.tensor(x, dtype=torch.long) for x in labels]
-        if isinstance(loss_mask[0], list):
-            loss_mask = [torch.tensor(x, dtype=torch.long) for x in loss_mask]
 
-        loss_mask_list = []
-        # only calculate loss on the tokens that are not masked
-        for label, loss_mask_item in zip(labels, loss_mask):
-            label[loss_mask_item==0] = -100
-            loss_mask_list.append(label)
+def forward_pass(model, batch: Dict[str, torch.Tensor], original_vocab_size: int, loss_with_grad: str = "all", losses_without_grad: List[str] = []):
+    # THIS IS CALLED INSIDE accelerator.accumulate()
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    loss_mask = batch["loss_mask"]
+    attention_mask = batch["attention_mask"]
+    num_items_in_batch = (batch["labels"].ne(-100)).sum().cpu()
 
-        loss_mask = loss_mask_list
-        del loss_mask_list
+    new_tokens_mask = input_ids >= original_vocab_size
+    num_new_tokens_in_batch = new_tokens_mask.sum().item()
 
-        # Compute padding
-        max_length_tokens = max(x.size(0) for x in input_ids)
-        if self.max_length is None:
-            max_length = max_length_tokens
-        else:
-            max_length = max(max_length_tokens, self.max_length)
-        
-        # Pad all tensors to max_length
-        padded_input_ids = []
-        padded_attention_mask = []
-        padded_labels = []
-        padded_loss_mask = []
+    # 1. Forward pass
+    # outputs = model(**batch, use_cache=False, num_items_in_batch=num_items_in_batch, new_token_start_index=original_vocab_size)
+    # num_items_in_batch=num_items_in_batch, 
+    outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"], use_cache=False)
+    main_loss = outputs.loss
 
-        for ids, attn_mask, lab, loss_mask_item in zip(input_ids, attention_mask, labels, loss_mask):
-            # Calculate padding length
-            pad_len = max_length - ids.size(0)
-            
-            if pad_len > 0:
-                # Pad input_ids
-                padded_input_ids.append(
-                    torch.cat([ids, torch.ones(pad_len, dtype=torch.long) * self.tokenizer.pad_token_id])
-                )
-                # Pad attention_mask
-                padded_attention_mask.append(
-                    torch.cat([attn_mask, torch.zeros(pad_len, dtype=torch.long)])
-                )
-                # Pad labels
-                padded_labels.append(
-                    torch.cat([lab, torch.ones(pad_len, dtype=torch.long) * -100])
-                )
-                # Pad loss_mask
-                padded_loss_mask.append(
-                    torch.cat([loss_mask_item, torch.zeros(pad_len, dtype=torch.long)])
-                )
-            else:
-                padded_input_ids.append(ids)
-                padded_attention_mask.append(attn_mask)
-                padded_labels.append(lab)
-                padded_loss_mask.append(loss_mask_item)
-                
-        # Stack all tensors
-        batch = {
-            "input_ids": torch.stack(padded_input_ids),
-            "attention_mask": torch.stack(padded_attention_mask),
-            "labels": torch.stack(padded_labels),
-            "loss_mask": torch.stack(padded_loss_mask)
-        }
-        
-        return batch
+    # 2. Translated loss
+    with torch.no_grad():
+        masked_labels = labels.clone()
+        masked_labels[loss_mask == 0] = -100
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=masked_labels, use_cache=False)
+        translated_loss = outputs.loss
+
+    # 3. New tokens loss
+    with torch.no_grad():
+        new_labels = labels.clone()
+        new_labels[new_tokens_mask] = -100
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=new_labels, use_cache=False)
+        new_tokens_loss = outputs.loss
+
+    return main_loss, translated_loss, new_tokens_loss, num_items_in_batch, num_new_tokens_in_batch
+
+
 
 
 def move_optimizer_to_cpu(optimizer):
@@ -565,26 +342,6 @@ def calculate_grad_norm(parameters, norm_type=2.0, error_if_nonfinite=False, for
     return total_norm
 
 
-def freeze_model_except_embeddings(model, freeze_output_embeddings=True):
-    # First freeze all parameters
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    # Unfreeze input embeddings
-    if hasattr(model, 'get_input_embeddings'):
-        model.get_input_embeddings().weight.requires_grad = True
-    
-    # Optionally unfreeze output embeddings if they're not tied
-    if not freeze_output_embeddings and hasattr(model, 'get_output_embeddings'):
-        output_embeddings = model.get_output_embeddings()
-        if output_embeddings is not None:
-            output_embeddings.weight.requires_grad = True
-    
-    # Print stats
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params:.2%} of total)")
-
 def main(args):
 
     global logger  # Update the logger once accelerator is initialized
@@ -600,21 +357,23 @@ def main(args):
         log_with="wandb" if args.wandb else None,
     )
 
+    finetuning_params = args.finetune_params
+
     if args.output_dir is not None:
         output_dir = args.output_dir
     else:
         total_batch_size = args.batch_size * args.gradient_accumulate_every * accelerator.num_processes
         if args.embedding_init_strategy is not None:
-            output_dir = f"output/{args.model.split('/')[-1]}-task_{args.task_name}-finetuning_mode_{args.finetuning_mode}-batch{total_batch_size}-extend_{args.embedding_init_strategy}"
+            output_dir = f"output/{args.model.split('/')[-1]}-task_{args.task_name}-finetuning_params_{finetuning_params}-batch{total_batch_size}-extend_{args.embedding_init_strategy}"
         else:
-            output_dir = f"output/{args.model.split('/')[-1]}-task_{args.task_name}-finetuning_mode_{args.finetuning_mode}-batch{total_batch_size}"
+            output_dir = f"output/{args.model.split('/')[-1]}-task_{args.task_name}-finetuning_params_{finetuning_params}-batch{total_batch_size}"
 
 
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    logger = setup_logging(logging.DEBUG)
-    # logger = setup_logging()
+    # logger = setup_logging(logging.DEBUG)
+    logger = setup_logging()
 
     if accelerator.is_main_process:
         if args.wandb:
@@ -650,20 +409,10 @@ def main(args):
     )
     logger.debug(f"Overwriting forward method of model")
     # model._old_forward = model.forward
-    # model.forward = my_custom_forward.__get__(model, model.__class__)
-
-    # TODO: implement finetuning modes
-    finetuning_mode = args.finetuning_mode
-    if finetuning_mode == "new_tokens_only":
-        raise NotImplementedError("New tokens only finetuning is not implemented yet")
-    elif finetuning_mode == "embeddings":
-        raise NotImplementedError("Embeddings finetuning is not implemented yet")
-    elif finetuning_mode == "full":
-        pass
-    else:
-        raise ValueError(f"Invalid finetuning mode: {finetuning_mode}")
-
-    if hasattr(model, "enable_input_require_grads"):  
+    # model.forward = my_custom_forward.__get__(model, type(model))
+    
+    if hasattr(model, "enable_input_require_grads"):
+        # TODO not sure what this does
         model.enable_input_require_grads()
 
     model.gradient_checkpointing_enable()
@@ -695,8 +444,6 @@ def main(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-
-    num_new_tokens = 0
     original_vocab_size = model.config.vocab_size
     logger.info(f"Tokenizer vocab size: {len(tokenizer)}, model vocab size: {original_vocab_size}")
     
@@ -716,6 +463,23 @@ def main(args):
     new_vocab_size = len(tokenizer.get_vocab())
     if embedding_size_in != new_vocab_size or embedding_size_out != new_vocab_size:
         raise ValueError(f"Embedding size {embedding_size_in}/{embedding_size_out} (input/output) does not match vocab size {new_vocab_size}")
+
+    # TODO: implement finetuning modes
+    if finetuning_params == "new_tokens_only":
+        model = freeze_old_embeddings(model, num_new_tokens)
+        raise NotImplementedError("New tokens only finetuning is not implemented yet")
+    elif finetuning_params == "embeddings":
+        model = freeze_model_except_embeddings(model)
+        raise NotImplementedError("Embeddings finetuning is not implemented yet")
+    elif finetuning_params == "full":
+        pass
+    else:
+        raise ValueError(f"Invalid finetuning mode: {finetuning_params}")
+
+    # finetuned_parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Finetuning_params: {finetuning_params}, Trainable parameters: {trainable_params:,} ({trainable_params/total_params:.2%} of total)")
 
     # After model loading
     logger.info(f"Model config: max_position_embeddings={model.config.max_position_embeddings}, "
@@ -742,8 +506,7 @@ def main(args):
         raise ValueError(f"Invalid task name: {task_name}")
     
     ds = load_from_disk(args.dataset)
-    # Split the dataset into train (90%) and validation (10%)
-    ds = ds.train_test_split(test_size=0.1)
+    ds = ds.train_test_split(test_size=0.1) # Split the dataset into train (90%) and validation (10%)
 
     train_loader = create_memory_efficient_loader(
         ds["train"],
@@ -920,6 +683,7 @@ def main(args):
         "log_samples": args.log_samples,
         "benchmark_tasks": args.benchmark_tasks,
     }
+
     eval_config["tokenizer"] = tokenizer
     if base_tokenizer is not None:
         eval_config["base_tokenizer"] = base_tokenizer
@@ -948,6 +712,8 @@ def main(args):
 
         model.train()
         # TODO add time of each iteration, and memory usage
+        if args.unfreeze_params_steps > 0 and update_step >= args.unfreeze_params_steps:
+            model = unfreeze_model(model)
     
         loss_log = None
         grad_norm = None
@@ -978,26 +744,11 @@ def main(args):
             total_batched_samples += 1
             # Move batch to device just before use
             batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-            num_items_in_batch = (batch["labels"].ne(-100)).sum().cpu()
             mem_before_forward = torch.cuda.memory_allocated() / 1024**2
             largest_batch_per_device = max(largest_batch_per_device, batch['input_ids'].numel())
 
-
-            logger.debug(f"Memory before forward pass opt_step: {update_step} accum_step:{i} - Device {accelerator.process_index}: {mem_before_forward:.2f} MB, "
-                f"num_items_in_batch {num_items_in_batch} samples: {batch['input_ids'].shape[0]}, "
-                f"{[(batch['labels'][x].ne(-100)).sum().item() for x in range(batch['input_ids'].shape[0])]}, largest_batch_per_device {largest_batch_per_device}",
+            logger.debug(f"Memory before forward pass opt_step: {update_step} accum_step:{i} - Device {accelerator.process_index}: {mem_before_forward:.2f} MB, largest_batch_per_device {largest_batch_per_device}",
                 main_process_only=False
-                )
-            # Before model forward pass
-            # Check if any new tokens are present in the batch
-            new_tokens_mask = batch['input_ids'] >= original_vocab_size
-            num_new_tokens_in_batch = new_tokens_mask.sum().item()
-            max_token_id = batch['input_ids'].max().item()
-            vocab_size = model.module.config.vocab_size
-            if max_token_id >= vocab_size:
-                raise ValueError(
-                    f"Token ID {max_token_id} found in batch, but vocab size is only {vocab_size}. "
-                    f"This will cause CUDA indexing errors."
                 )
 
             # IMPORTANT:
@@ -1005,47 +756,30 @@ def main(args):
             # but the gradients accumulate across all processes.
             # therefore you dont need to only do grad.step() on the main process/sync step because it knows   
             with accelerator.accumulate(model):  # Use accelerator's context manager
-                # 1. Forward pass
-                # outputs = model(**batch, use_cache=False, num_items_in_batch=num_items_in_batch, new_token_start_index=original_vocab_size)
-                # print("labels shape:", batch["labels"].shape if "labels" in batch else None, "loss_mask shape:", batch["loss_mask"].shape if "loss_mask" in batch else None)
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],           # must be present
-                    loss_mask=batch["loss_mask"],     # must be present
-                    use_cache=False,
-                    num_items_in_batch=num_items_in_batch,
-                    new_token_start_index=original_vocab_size
+                # Call the forward_pass function
+                main_loss, translated_loss, new_tokens_loss, num_items_in_batch, num_new_tokens_in_batch = forward_pass(
+                    model, batch, original_vocab_size
                 )
-                # print(f"outputs: {outputs}")
-                loss = outputs.loss
-                loss_new_tokens = 0 # TODO need to fix this outputs.loss_new_tokens.item()
-                # loss = (loss * gradient_accumulation_steps * accelerator.num_processes)
 
                 mem_before_backward = torch.cuda.memory_allocated() / 1024**2
                 logger.debug(f"Memory before backwards pass opt_step: {update_step} accum_step:{i} - Device {accelerator.process_index}: {mem_before_backward:.2f} MB", main_process_only=False)
+                accelerator.backward(main_loss)
 
-                accelerator.backward(loss)
-                # Immediate cleanup after backward pass
-
-                accumulated_losses.append(loss.item())  # Move loss to CPU immediately
-                accumulated_losses_new_tokens.append(loss_new_tokens)
-                accumulated_token_counts.append(num_items_in_batch.item())
+                # Accumulate losses and other metrics
+                accumulated_losses.append(main_loss.item())
+                accumulated_losses_new_tokens.append(new_tokens_loss.item())
+                accumulated_token_counts.append(num_items_in_batch)
                 accumulation_batch_counter += 1
                 new_token_counter.append(num_new_tokens_in_batch)
 
-                # DO SIMPLE AVERAGE OVER ACCUMULATION STEPS
                 del outputs
                 del loss
-                torch.cuda.empty_cache()  # Consider moving this outside the loop
+                # torch.cuda.empty_cache()  # Consider moving this outside the loop
                 
                 if accelerator.sync_gradients:
                     if num_new_tokens > 0:
                         new_embeddings_list = get_new_embeddings_grads(model, num_new_tokens)
                         new_embeddings_grad_norm = calculate_grad_norm(new_embeddings_list, is_grad=True)
-
-                        # new_embeddings_list = get_new_embedding_params(model, num_new_tokens)
-                        # new_embeddings_grad_norm = accelerator.clip_grad_norm_(new_embeddings_list, float('inf'))
 
                     if args.grad_norm is not None:
                         accelerator.clip_grad_norm_(model.parameters(), args.grad_norm)
@@ -1268,74 +1002,74 @@ if __name__ == "__main__":
         threads = os.cpu_count()
 
     args = argparse.ArgumentParser()
+
+    # implementation params
     args.add_argument("--dry-run", action="store_true")
     args.add_argument("--batch-size", type=int, default=1)
     args.add_argument("--cpu-batch-size", type=int, default=1000)
-    args.add_argument("--gradient-accumulate-every", type=int, default=8)
-    args.add_argument("--resume-from-checkpoint", type=str)
     args.add_argument("--checkpointing-steps", type=int)
-    args.add_argument("--output-dir", type=str, required=False, default=None)
+    args.add_argument("--resume-from-checkpoint", type=str)  # TODO
     args.add_argument("--wandb", type=str)
     args.add_argument("--wandb-tags", type=str)
     args.add_argument("--seed", type=int, default=42)
-    args.add_argument("--max-train-steps", type=int, default=-1)
-    args.add_argument("--num-epochs", type=int, default=-1)
-    args.add_argument("--warmup-steps", type=int, default=10)
-    args.add_argument("--learning-rate", type=float, default=2e-5)
-    args.add_argument("--grad-norm", type=float, default=1.0, 
-                     help="Max norm for gradient clipping. Set to None to disable.")
-    args.add_argument("--lora", action="store_true")
-    args.add_argument("--model", type=str,
-                      default="meta-llama/Llama-3.2-1B")
-    args.add_argument("--scaling-factor", type=float, default=16.0)
-    args.add_argument("--scaling-type", type=str, default="yarn")
-    args.add_argument("--rope-theta", type=float, default=10000.0)
-    args.add_argument("--truncate", type=int)
-    args.add_argument("--dataset", type=str,
-                      default="emozilla/pg_books-tokenized-bos-eos-chunked-65536")
-    args.add_argument("--deepspeed", action="store_true")
-    
+    args.add_argument("--output-dir", type=str, required=False, default=None)
     args.add_argument("--num-proc", type=int, default=threads)
-    # args.add_argument("--architecture", type=str,
-    #                   choices=["llama", "mistral", "gemma"], default="llama")
-    args.add_argument("--max-position-embeddings", type=int)
-    args.add_argument("--sliding-window-attention-schedule", type=str)
-    args.add_argument("--lr-schedule", type=str,
-                      choices=["linear", "constant"], default="linear")
     args.add_argument("--save-only", action="store_true")
     args.add_argument("--save-dataset-path", type=str)
-    args.add_argument("--tokenizer-path", type=str)
-    args.add_argument("--force-tokenize", action="store_true")
-    args.add_argument("--log-loss", type=str)
-    args.add_argument("--original-max-position-embeddings", type=int)
-    args.add_argument("--eval-steps", type=int, default=1000,
-                     help="Number of steps between evaluations")
-    args.add_argument("--eval-iters", type=int, default=100,
-                     help="Number of iterations to run for evaluation")
-    args.add_argument("--memory-efficient", action="store_true", 
-                     help="Enable memory efficient training mode")
-    args.add_argument("--auto-batch-size", action="store_true",
-                     help="Automatically find optimal batch size")
-    args.add_argument("--cpu-offload", action="store_true",
-                     help="Enable CPU offloading for optimizer states")
-    args.add_argument("--embedding-init-strategy", type=str,
-                     choices=["default", "random", "clone", "mean", "zeros", "merge", None],
-                     default=None,
-                     help="Strategy for initializing new token embeddings")
     args.add_argument("--save-model", type=str,
-                     choices=["final", "all", None],
-                     default="all",
-                     help="Whether to save the model after training")
-    args.add_argument("--finetuning-mode", type=str,
-                      choices=["full", "embeddings", "new_tokens_only"],
-                      default="full",
-                      help="Whether to finetune the model parameters")
+                    choices=["final", "all", None],
+                    default="all",
+                    help="Whether to save the model after training")
+
+    # finetuning params
+    args.add_argument("--dataset", type=str, default="emozilla/pg_books-tokenized-bos-eos-chunked-65536")
+    args.add_argument("--gradient-accumulate-every", type=int, default=8)
+    args.add_argument("--max-train-steps", type=int, default=-1)
+    args.add_argument("--num-epochs", type=int, default=-1)
+    args.add_argument("--grad-norm", type=float, default=1.0, help="Max norm for gradient clipping. Set to None to disable.")
+    args.add_argument("--lora", action="store_true")  # TODO
+    args.add_argument("--deepspeed", action="store_true")  # TODO
     args.add_argument("--task-name", type=str,
                       choices=["SFT", "translation", "mixed"],
                       default="SFT",
                       help="Whether to finetune the model parameters")
+    # positional embeddings
+    args.add_argument("--scaling-factor", type=float, default=16.0) # TODO
+    args.add_argument("--scaling-type", type=str, default="yarn") # TODO
+    args.add_argument("--rope-theta", type=float, default=10000.0) # TODO
+    args.add_argument("--original-max-position-embeddings", type=int)
+    args.add_argument("--max-position-embeddings", type=int)
+    # LR 
+    args.add_argument("--learning-rate", type=float, default=2e-5)
+    args.add_argument("--warmup-steps", type=int, default=10)
+    args.add_argument("--lr-schedule", type=str, choices=["linear", "constant"], default="linear")
+    
+    # Model params
+    args.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B")
+    # args.add_argument("--architecture", type=str,
+    #                   choices=["llama", "mistral", "gemma"], default="llama")
+    args.add_argument("--sliding-window-attention-schedule", type=str)  # TODO
+    args.add_argument("--tokenizer-path", type=str)
+    args.add_argument("--pre-tok-name", type=str, default="empty")
+    
+    # vocab extension params
+    args.add_argument("--embedding-init-strategy", type=str,
+                     choices=["default", "random", "clone", "mean", "zeros", "merge", None],
+                     default=None,
+                     help="Strategy for initializing new token embeddings")
+    args.add_argument("--finetuning-params", type=str,
+                      choices=["full", "embeddings", "new_tokens_only"],
+                      default="full",
+                      help="Whether to finetune the model parameters")
+    args.add_argument("--unfreeze-params-steps", type=int,
+                    default=-1,
+                    help="Steps to switch to finetuning params")
 
     # EVAL PARAMS
+    args.add_argument("--eval-steps", type=int, default=1000,
+                     help="Number of steps between evaluations")
+    args.add_argument("--eval-iters", type=int, default=100,
+                     help="Number of iterations to run for evaluation")
     args.add_argument("--run-lm-eval", action="store_true",
                      help="Run language model evaluation")
     args.add_argument("--eval-batch-size", type=int, default=2,
@@ -1348,7 +1082,6 @@ if __name__ == "__main__":
                      help="store actual samples from benchmark")
     args.add_argument("--benchmark-tasks", type=str, default="minerva_math",
                      help="Benchmark tasks to run")
-    args.add_argument("--pre-tok-name", type=str, default="empty")
     
     args = args.parse_args()
 
