@@ -6,8 +6,8 @@ from datasets import load_dataset, load_from_disk, DatasetDict
 from datetime import timedelta
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
-from accelerate.utils import InitProcessGroupKwargs, set_seed
-from accelerate.state import AcceleratorState
+from accelerate.utils import InitProcessGroupKwargs, set_seed, ProjectConfiguration, DataLoaderConfiguration
+from accelerate.state import AcceleratorState, PartialState
 from tqdm import tqdm
 from transformers import set_seed, DataCollatorWithPadding, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup, AutoModelForCausalLM, TrainingArguments, Trainer, TextStreamer, AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 import datasets
@@ -17,16 +17,20 @@ import csv
 import shutil
 import math
 from typing import Any, Dict, List, Union
+from collections import defaultdict
 
 from accelerate.logging import get_logger
 import logging
 import json
+import glob
 
 import psutil
 from efficient_tokenization.tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer
 from efficient_tokenization.extend_embeddings import extend_model_embeddings, initialize_new_embeddings, get_new_embedding_params, get_new_embeddings_grads, unfreeze_model, freeze_model_except_embeddings, freeze_old_embeddings
-from efficient_tokenization.data_utils import MyPaddingCollator, MyPaddingCollatorWithLossMask
+from efficient_tokenization.data_utils import MyPaddingCollator, MyPaddingCollatorWithLossMask, create_memory_efficient_loader
 from efficient_tokenization.utils import setup_logging, check_disk_space
+from efficient_tokenization.model_utils import forward_pass, move_optimizer_to_cpu, move_optimizer_to_gpu, calculate_grad_norm
+from efficient_tokenization.benchmarking_utils import get_lm_eval_string
 
 from lm_eval import evaluator, tasks, utils, models
 from lm_eval.tasks import TaskManager
@@ -38,19 +42,6 @@ from liger_kernel.transformers import AutoLigerKernelForCausalLM, LigerCrossEntr
 import gc
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
-
-def find_all_linear_names(model):
-    lora_module_names = set()
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            names = name.split(".")
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
-    if "lm_head" in lora_module_names:
-        lora_module_names.remove("lm_head")
-
-    return list(lora_module_names)
 
 
 # def initialize_distributed():
@@ -71,6 +62,24 @@ def log_loss(metrics_dict, output_dir, filename="loss_log.csv"):
         if not file_exists:
             writer.writerow(metrics_dict.keys())
         writer.writerow(metrics_dict.values())
+
+def get_latest_checkpoint(output_dir):
+    """Find the latest checkpoint in the checkpoints directory."""
+    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    if not os.path.exists(checkpoint_dir):
+        logger.warning(f"No checkpoints directory found at {checkpoint_dir}")
+        return None
+    
+    checkpoint_paths = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*"))
+    if not checkpoint_paths:
+        logger.warning(f"No checkpoints found in {checkpoint_dir}")
+        return None
+    
+    # Sort by modification time (most recent first)
+    checkpoint_paths.sort(key=os.path.getmtime, reverse=True)
+    latest = checkpoint_paths[0]
+    logger.info(f"Found latest checkpoint: {latest}")
+    return latest
 
 def benchmark(model, config):
     """
@@ -162,35 +171,67 @@ def benchmark(model, config):
 
     return output_results
 
-def run_evaluation(model, eval_loader, accelerator, num_steps):
+def run_evaluation_loop(model, eval_loader, accelerator, num_steps: int, loss_types: List[str] = [], materialize_logits: bool = True):
     with torch.no_grad():
-        losses = []
-        tokens = []
+        all_gathered_losses = defaultdict(list)
+        all_gathered_tokens = defaultdict(list)
         for i, batch in enumerate(eval_loader):
             if i >= num_steps:
                 break
-            num_items_in_batch = (batch["labels"].ne(-100)).sum().cpu().item()
+            # num_items_in_batch = (batch["labels"].ne(-100)).sum().cpu().item()
 
-            outputs = model(**batch, use_cache=False, num_items_in_batch=num_items_in_batch)
+            if len(loss_types) == 1:
+                # if only tracking one loss, use that loss for main loss
+                main_loss_type = loss_types[0]
+                loss_types = []
+            else:
+                main_loss_type = None
 
-            loss_value = outputs.loss.item()
-            gathered_metrics = accelerator.gather_for_metrics([loss_value, num_items_in_batch])
-            loss_value = gathered_metrics[0::2]
-            num_items_in_batch = gathered_metrics[1::2]
-            losses.extend(loss_value)
-            tokens.extend(num_items_in_batch)
-            del outputs
-                
-        batch_sum_weighted_loss = 0
-        batch_total_tokens = 0
-        for loss, tok in zip(losses, tokens):
-            batch_sum_weighted_loss += loss * tok
-            batch_total_tokens += tok
+            main_loss, tracked_losses, num_items_for_main_loss, tracked_tokens_per_loss_type = forward_pass(
+                model, batch, loss_with_grad=main_loss_type, losses_without_grad=loss_types, materialize_logits=materialize_logits
+            )
+            if main_loss_type is not None:
+                tracked_losses[main_loss_type] = main_loss.item()
+                tracked_tokens_per_loss_type[main_loss_type] = num_items_for_main_loss
 
-        weighted_avg_loss = batch_sum_weighted_loss / batch_total_tokens
-        avg_loss = sum(losses) / len(losses)
+            values_to_gather = [
+                tracked_losses,
+                tracked_tokens_per_loss_type
+                ]
+            
+            num_gathered_metrics = len(values_to_gather)
+            gathered_metrics = accelerator.gather_for_metrics(values_to_gather)
+            gathered_losses = gathered_metrics[0::num_gathered_metrics]
+            gathered_tokens = gathered_metrics[1::num_gathered_metrics]
 
-    return {"weighted_loss": weighted_avg_loss, "loss": avg_loss}
+            for loss_dict in gathered_losses:
+                for key, loss_val in loss_dict.items():
+                    all_gathered_losses[key].append(loss_val)
+            
+            for token_dict in gathered_tokens:
+                for key, token_count in token_dict.items():
+                    all_gathered_tokens[key].append(token_count)
+                    
+            del main_loss, tracked_losses, num_items_for_main_loss, tracked_tokens_per_loss_type
+
+        losses_dict = {}
+        for loss_type in all_gathered_losses.keys():
+            losses = all_gathered_losses[loss_type]
+            tokens = all_gathered_tokens[loss_type]
+
+            batch_sum_weighted_loss = 0
+            batch_total_tokens = 0
+            for loss, tok in zip(losses, tokens):
+                batch_sum_weighted_loss += loss * tok
+                batch_total_tokens += tok
+
+            weighted_avg_loss = batch_sum_weighted_loss / batch_total_tokens
+            avg_loss = sum(losses) / len(losses)
+
+            losses_dict[f"{loss_type}_weighted_loss"] = weighted_avg_loss
+            losses_dict[f"{loss_type}_loss"] = avg_loss
+
+    return losses_dict
 
 
 def evaluate(model, eval_loader, accelerator, num_steps=100, eval_config: Dict = None):
@@ -207,139 +248,10 @@ def evaluate(model, eval_loader, accelerator, num_steps=100, eval_config: Dict =
 
     accelerator.wait_for_everyone()
     
-    eval_loop_results = run_evaluation(model, eval_loader, accelerator, num_steps)
+    eval_loop_results = run_evaluation_loop(model, eval_loader, accelerator, num_steps, eval_config.get("losses_to_track", []), eval_config.get("materialize_logits", True))
 
     results.update(eval_loop_results)
     return results
-
-
-
-
-def calc_loss_with_grad(model, input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor = None):
-    pass
-
-
-@torch.no_grad()
-def calc_loss_without_grad(model, input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor = None):
-    pass
-
-
-def forward_pass(model, batch: Dict[str, torch.Tensor], original_vocab_size: int, loss_with_grad: str = "all", losses_without_grad: List[str] = []):
-    # THIS IS CALLED INSIDE accelerator.accumulate()
-    input_ids = batch["input_ids"]
-    labels = batch["labels"]
-    loss_mask = batch["loss_mask"]
-    attention_mask = batch["attention_mask"]
-    num_items_in_batch = (batch["labels"].ne(-100)).sum().cpu()
-
-    new_tokens_mask = input_ids >= original_vocab_size
-    num_new_tokens_in_batch = new_tokens_mask.sum().item()
-
-    # 1. Forward pass
-    # outputs = model(**batch, use_cache=False, num_items_in_batch=num_items_in_batch, new_token_start_index=original_vocab_size)
-    # num_items_in_batch=num_items_in_batch, 
-    outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"], use_cache=False)
-    main_loss = outputs.loss
-
-    # 2. Translated loss
-    with torch.no_grad():
-        masked_labels = labels.clone()
-        masked_labels[loss_mask == 0] = -100
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=masked_labels, use_cache=False)
-        translated_loss = outputs.loss
-
-    # 3. New tokens loss
-    with torch.no_grad():
-        new_labels = labels.clone()
-        new_labels[new_tokens_mask] = -100
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=new_labels, use_cache=False)
-        new_tokens_loss = outputs.loss
-
-    return main_loss, translated_loss, new_tokens_loss, num_items_in_batch, num_new_tokens_in_batch
-
-
-
-
-def move_optimizer_to_cpu(optimizer):
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):  # Check for tensor type
-                state[k] = v.cpu()
-                del v  # Explicitly delete GPU tensor
-    torch.cuda.empty_cache()
-
-
-def move_optimizer_to_gpu(optimizer):
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):  # Check for tensor type
-                state[k] = v.cuda()
-                del v  # Explicitly delete CPU tensor
-    torch.cuda.empty_cache()
-
-
-def log_memory_usage(step, phase, accelerator):
-    """Log memory usage at various points in training"""
-    if accelerator.is_local_main_process:
-        gpu_memory_allocated = torch.cuda.memory_allocated() / 1024**2
-        gpu_memory_reserved = torch.cuda.memory_reserved() / 1024**2
-        logger.info(f"Step {step} - {phase} - "
-                   f"GPU Memory Allocated: {gpu_memory_allocated:.2f}MB, "
-                   f"Reserved: {gpu_memory_reserved:.2f}MB")
-
-def find_optimal_batch_size(model, initial_batch_size, tokenizer, accelerator):
-    """Dynamically find the largest batch size that fits in memory"""
-    batch_size = initial_batch_size
-    while batch_size > 1:
-        try:
-            # Create a sample batch
-            sample_input = tokenizer("test" * 100, return_tensors="pt", padding=True)
-            sample_input = {k: v.repeat(batch_size, 1).to(accelerator.device) for k, v in sample_input.items()}
-            
-            # Test forward and backward pass
-            with torch.cuda.amp.autocast():
-                outputs = model(**sample_input)
-                loss = outputs.loss
-                accelerator.backward(loss)
-            
-            del outputs, loss
-            torch.cuda.empty_cache()
-            return batch_size
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                batch_size //= 2
-                torch.cuda.empty_cache()
-            else:
-                raise e
-    return 1
-
-def create_memory_efficient_loader(dataset, batch_size, collate_fn, num_proc):
-    """Create a memory-efficient data loader"""
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        pin_memory=True,
-        prefetch_factor=2,  # Reduce prefetching
-        # persistent_workers=True,  # THIS throws an error
-        num_workers=num_proc  # Adjust based on CPU cores
-    )
-
-
-def calculate_grad_norm(parameters, norm_type=2.0, error_if_nonfinite=False, foreach=None, is_grad=False):
-    if isinstance(parameters, torch.Tensor):
-        parameters = [parameters]
-    else:
-        # prevent generators from being exhausted
-        parameters = list(parameters)
-    if not is_grad:
-        grads = [p.grad for p in parameters if p.grad is not None]
-    else:
-        grads = parameters
-    # print(f"parameters: {[p.shape for p in parameters]}, grads:{[g.shape for g in grads]}, {grads}")
-    total_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
-    return total_norm
 
 
 def main(args):
@@ -348,79 +260,104 @@ def main(args):
 
     set_seed(args.seed)
 
+    state = PartialState()
+    num_processes = state.num_processes
+
+    # Batch size stuff
+    if args.total_batch_size is not None:
+        total_batch_size = args.total_batch_size
+        if args.batch_size is not None:
+            batch_size = args.batch_size
+            gradient_accumulation_steps = total_batch_size // (batch_size * num_processes)
+        elif args.gradient_accumulate_every is not None:
+            gradient_accumulation_steps = args.gradient_accumulate_every
+            batch_size = total_batch_size // (gradient_accumulation_steps * num_processes)
+        else:
+            raise ValueError("Either batch_size or gradient_accumulate_every must be provided if inferring from total_batch_size")
+    else:
+        gradient_accumulation_steps = args.gradient_accumulate_every
+        batch_size = args.batch_size
+        total_batch_size = args.batch_size * args.gradient_accumulate_every * num_processes
+
+    # make sure the rounding is correct
+    total_batch_size = (
+        batch_size * num_processes * gradient_accumulation_steps
+    )
+    num_epochs = args.num_epochs
+
+    args.batch_size = batch_size
+    args.gradient_accumulate_every = gradient_accumulation_steps
+    args.total_batch_size = total_batch_size
+
+    # output file naming stuff
+    finetuning_params = args.finetune_params
+    if args.output_dir is not None:
+        output_dir = args.output_dir
+    else:
+        output_folder = "output"
+        output_dir = f"{args.model.split('/')[-1]}-task_{args.task_name}-finetuning_params_{finetuning_params}-batch{total_batch_size}"
+        if args.embedding_init_strategy is not None:
+            output_dir += f"-extend_{args.embedding_init_strategy}"
+        if args.dry_run:
+            output_dir = "dryrun-" + output_dir
+        output_dir = os.path.join(output_folder, output_dir)
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     timeout = InitProcessGroupKwargs(timeout=timedelta(seconds=1_000_000))
+    project_config = ProjectConfiguration(project_dir=output_dir, 
+                                          automatic_checkpoint_naming=True
+                                          )
+    
+    dataloader_config = DataLoaderConfiguration(
+        use_stateful_dataloader=True
+    )
+    dataloader_config = None
+
+    # Create accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulate_every,
         mixed_precision="bf16",
         # mixed_precision="fp16",
         kwargs_handlers=[timeout],
+        project_config=project_config,
         log_with="wandb" if args.wandb else None,
+        dataloader_config=dataloader_config
     )
-
-    finetuning_params = args.finetune_params
-
-    if args.output_dir is not None:
-        output_dir = args.output_dir
-    else:
-        total_batch_size = args.batch_size * args.gradient_accumulate_every * accelerator.num_processes
-        if args.embedding_init_strategy is not None:
-            output_dir = f"output/{args.model.split('/')[-1]}-task_{args.task_name}-finetuning_params_{finetuning_params}-batch{total_batch_size}-extend_{args.embedding_init_strategy}"
-        else:
-            output_dir = f"output/{args.model.split('/')[-1]}-task_{args.task_name}-finetuning_params_{finetuning_params}-batch{total_batch_size}"
-
-
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    # logger = setup_logging(logging.DEBUG)
-    logger = setup_logging()
-
-    if accelerator.is_main_process:
-        if args.wandb:
-            import wandb
-            tags = args.wandb_tags.split(",") if args.wandb_tags else None
-            tags = tags if len(tags) > 0 else None
-            logger.info(f"Logging to wandb with tags: {tags}")
-            wandb.login()
-            wandb.init(project=args.wandb,
-                       tags=tags,
-                       name=f"Training Run {output_dir.split('/')[-1]}", 
-                       config=vars(args)
-                       )
-
-    accelerator.init_trackers(
-        project_name=args.wandb if args.wandb else "efficient-tokenization",
-    )
-    logger.info(f"Total GPUS: {accelerator.num_processes}")
 
     save_model_type = args.save_model
+    logging_mode = args.logging_mode
     if args.dry_run:
-        save_model_type = None
+        logging_mode = logging.DEBUG
+        if args.wandb and args.wandb_tags:
+            args.wandb_tags = "dryrun"
+        if args.checkpointing_steps > 1:  #sometimes we are checking checkpoints every step and we dont want dry run to prevent that
+            save_model_type = None
 
-    # Load config
+    logger = setup_logging(logging_mode)
+
+    # initialize objects
+    # Model
+    logger.info(f"Loading model from {args.model}...")
     model = AutoLigerKernelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
-        cross_entropy=True,
-        fused_linear_cross_entropy=False,
+        # cross_entropy=True,
+        # fused_linear_cross_entropy=False,
         # config=config,
         # use_cache=False,  # Disable KV cache during training
     )
-    logger.debug(f"Overwriting forward method of model")
-    # model._old_forward = model.forward
-    # model.forward = my_custom_forward.__get__(model, type(model))
     
     if hasattr(model, "enable_input_require_grads"):
         # TODO not sure what this does
         model.enable_input_require_grads()
 
     model.gradient_checkpointing_enable()
-    logger.info("Loading model and tokenizer...")
 
-    gradient_accumulation_steps = args.gradient_accumulate_every
-    num_epochs = args.num_epochs
-
+    # Tokenizer
+    logger.info("Loading tokenizer...")
     base_tokenizer = None
     vocab_file_path = None
     pre_tok_name = None
@@ -445,9 +382,40 @@ def main(args):
         tokenizer.pad_token = tokenizer.eos_token
 
     original_vocab_size = model.config.vocab_size
+    model.config.original_vocab_size = original_vocab_size
     logger.info(f"Tokenizer vocab size: {len(tokenizer)}, model vocab size: {original_vocab_size}")
-    
     num_new_tokens = len(tokenizer) - model.config.vocab_size
+
+    # Optimizer
+    optim = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, fused=True)
+    logger.info(f"Initial learning rate from optimizer: {optim.param_groups[0]['lr']}")
+        
+    if accelerator.is_main_process:
+        if args.wandb:
+            import wandb
+            tags = args.wandb_tags if len(args.wandb_tags) > 0 else None
+            logger.info(f"Logging to wandb with tags: {tags}")
+            wandb.login()
+            wandb.init(project=args.wandb,
+                       tags=tags,
+                       name=f"Training Run {output_dir.split('/')[-1]}", 
+                       config=vars(args)
+                       )
+
+    accelerator.init_trackers(
+        project_name=args.wandb if args.wandb else "efficient-tokenization",
+    )
+
+    # candidate losses to track and backpropagate on
+    main_loss_type = args.main_loss
+    other_loss_types = args.train_losses_to_track
+    eval_other_loss_types = args.eval_losses_to_track
+    try:
+        other_loss_types.remove(main_loss_type)
+    except:
+        pass
+
+    # Extend model embeddings if specified
     if args.embedding_init_strategy is not None and num_new_tokens > 0:
         # Extend model embeddings
         logger.info(f"Extending model embeddings with strategy: {args.embedding_init_strategy} and adding {num_new_tokens} new tokens")
@@ -457,7 +425,14 @@ def main(args):
             init_strategy=args.embedding_init_strategy,
             tokenizer=tokenizer
         )
-    
+        if "new_tokens" not in eval_other_loss_types:
+            eval_other_loss_types.append("new_tokens")
+    else:
+        # not extending embeddings
+        logger.info(f"Not extending model embeddings")
+        main_loss_type = "all"
+        other_loss_types = []
+
     embedding_size_in = model.get_input_embeddings().weight.shape[0]
     embedding_size_out = model.get_output_embeddings().weight.shape[0]
     new_vocab_size = len(tokenizer.get_vocab())
@@ -465,12 +440,13 @@ def main(args):
         raise ValueError(f"Embedding size {embedding_size_in}/{embedding_size_out} (input/output) does not match vocab size {new_vocab_size}")
 
     # TODO: implement finetuning modes
+    model_is_frozen = False
     if finetuning_params == "new_tokens_only":
         model = freeze_old_embeddings(model, num_new_tokens)
-        raise NotImplementedError("New tokens only finetuning is not implemented yet")
+        model_is_frozen = True
     elif finetuning_params == "embeddings":
         model = freeze_model_except_embeddings(model)
-        raise NotImplementedError("Embeddings finetuning is not implemented yet")
+        model_is_frozen = True
     elif finetuning_params == "full":
         pass
     else:
@@ -485,32 +461,47 @@ def main(args):
     logger.info(f"Model config: max_position_embeddings={model.config.max_position_embeddings}, "
                f"vocab_size={model.config.vocab_size}")
 
-    if hasattr(model.config, "rope_scaling"):
-        logger.info(f"RoPE scaling config: {model.config.rope_scaling}")
+
+    # postional embedding scaling
+    # if hasattr(model.config, "rope_scaling"):
+    #     logger.info(f"RoPE scaling config: {model.config.rope_scaling}")
 
     # TODO: implement task 
+    # DATA stuff
     task_name = args.task_name
     if task_name == "SFT":
         data_collator = MyPaddingCollator(
             tokenizer=tokenizer,
             max_length=args.max_length if hasattr(args, 'max_length') else None
         )
+        if "translated" in other_loss_types:
+            other_loss_types.remove("translated")
+
+        if "translated" in eval_other_loss_types:
+            eval_other_loss_types.remove("translated")
     elif task_name == "translation":
         data_collator = MyPaddingCollatorWithLossMask(
             tokenizer=tokenizer,
             max_length=args.max_length if hasattr(args, 'max_length') else None
         )
+        if "translated" not in other_loss_types:
+            other_loss_types.append("translated")
+
+        if "translated" not in eval_other_loss_types:
+            eval_other_loss_types.append("translated")
     elif task_name == "mixed":
         raise NotImplementedError("Mixed task is not implemented yet")
     else:
         raise ValueError(f"Invalid task name: {task_name}")
     
+    logger.info(f"primary loss: {main_loss_type}, train tracked losses: {other_loss_types}, eval tracked losses: {eval_other_loss_types}")
+
     ds = load_from_disk(args.dataset)
     ds = ds.train_test_split(test_size=0.1) # Split the dataset into train (90%) and validation (10%)
 
     train_loader = create_memory_efficient_loader(
         ds["train"],
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         collate_fn=data_collator,
         num_proc=args.num_proc
     )
@@ -528,80 +519,6 @@ def main(args):
     eval_batches = len(eval_loader)
     eval_loader_token_count = sum(ds["test"]["num_tokens"])
 
-    logger.info("Loaded data into dataset")
-
-    # if args.lora:
-    #     from peft import get_peft_model, LoraConfig, TaskType
-    #     target_modules = find_all_linear_names(model)
-    #     my_logger(accelerator, f"LoRA target modules: {target_modules}")
-    #     peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False,
-    #                              r=16, lora_alpha=64, lora_dropout=0.05, target_modules=target_modules)
-    #     model = get_peft_model(model, peft_config)
-    #     model.print_trainable_parameters()
-
-    # if args.deepspeed:
-    #     from accelerate.utils import DummyOptim, DummyScheduler
-    #     optim = DummyOptim(model.parameters(), lr=args.learning_rate)
-    #     scheduler = DummyScheduler(
-    #         optim, num_training_steps=args.max_train_steps, num_warmup_steps=args.warmup_steps)
-    #     model, optim, train_loader, scheduler = accelerator.prepare(
-    #         model, optim, train_loader, scheduler
-    #     )
-    # else:
-    optim = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, fused=True)
-
-    logger.info(f"Initial learning rate from optimizer: {optim.param_groups[0]['lr']}")
-
-    if args.max_train_steps > 0:
-        max_train_steps = args.max_train_steps
-    else:
-        max_train_steps = train_batches//(gradient_accumulation_steps * accelerator.num_processes)
-
-    # these calculations are done AFTER the accelerator is initialized
-    num_batches_per_device_per_epoch = len(train_loader)
-    grad_updates_per_device_per_epoch = math.ceil(num_batches_per_device_per_epoch / gradient_accumulation_steps)
-
-    epoch_remainder_on_device = num_batches_per_device_per_epoch % gradient_accumulation_steps
-    epoch_remainder_on_device = epoch_remainder_on_device if epoch_remainder_on_device != 0 else gradient_accumulation_steps
-
-    if num_epochs > 0:
-        total_gradient_updates = min(max_train_steps, grad_updates_per_device_per_epoch * num_epochs * accelerator.num_processes)
-        total_gradient_updates_per_device = min(math.ceil(max_train_steps // accelerator.num_processes), grad_updates_per_device_per_epoch * num_epochs)
-    else:
-        total_gradient_updates = max_train_steps
-        total_gradient_updates_per_device = math.ceil(max_train_steps // accelerator.num_processes)
-
-
-    if args.lr_schedule == "linear":
-        scheduler = get_linear_schedule_with_warmup(
-            optim, 
-            num_training_steps=max_train_steps,
-            num_warmup_steps=args.warmup_steps
-        )
-    elif args.lr_schedule == "constant":
-        scheduler = get_constant_schedule_with_warmup(
-            optim, 
-            num_warmup_steps=args.warmup_steps
-        )
-
-    logger.info("Preparing artifacts")
-
-    # prepare artifacts - accelerator handles device placement and dataloader splitting
-    model, optim = accelerator.prepare(model, optim)
-    train_loader = accelerator.prepare_data_loader(train_loader, device_placement=True)
-    eval_loader = accelerator.prepare_data_loader(eval_loader, device_placement=True)
-    training_iterator = iter(train_loader)
-
-    split_scheduler = False
-    if split_scheduler:
-        scheduler = accelerator.prepare(scheduler)
-
-    # Batch size stuff
-    accelerator.register_for_checkpointing(scheduler)
-    total_batch_size = (
-        args.batch_size * accelerator.num_processes * gradient_accumulation_steps
-    )
-
     def get_next_batch(training_iterator, train_loader, epoch):
         try:
             batch = next(training_iterator)
@@ -616,43 +533,57 @@ def main(args):
             batch = next(training_iterator)
             batch = {k: v.cpu() for k, v in batch.items()}
             return batch, training_iterator, epoch
+        
+    logger.info("Loaded data into dataset")
 
-    logger.info(f"max train steps {max_train_steps} ({math.ceil(max_train_steps / accelerator.num_processes)} per device)")
-    logger.info(f"total gradient updates {total_gradient_updates} ({total_gradient_updates_per_device} per device)")
-    logger.info(f"grad updates per epoch {grad_updates_per_device_per_epoch * accelerator.num_processes} ({grad_updates_per_device_per_epoch} per device)")
-    logger.info(f"train samples: {train_samples}, batches: {train_batches}, and tokens: {train_loader_token_count}")
-    logger.info(f"train samples per device: {len(train_loader) * args.batch_size}, batches per device: {len(train_loader)}, and tokens (approx): {train_loader_token_count / accelerator.num_processes}")
-    logger.info(f"eval samples: {eval_samples}, batches: {eval_batches}, and tokens: {eval_loader_token_count}")
-    logger.info(f"eval samples per device: {len(eval_loader) * args.eval_batch_size}, batches per device: {len(eval_loader)}, and tokens (approx): {eval_loader_token_count / accelerator.num_processes}")
-    logger.info(f"gradient steps {gradient_accumulation_steps}")
-    logger.info(f"per device batch size {args.batch_size}, eval batch size {args.eval_batch_size}")
-    logger.info(f"accelerator distributed type {accelerator.distributed_type}, num_processes {accelerator.num_processes}")
-    logger.info(f"effective batch size {total_batch_size}")
-    logger.info(f"learning rate {args.learning_rate}, warmup steps {args.warmup_steps}, schedule_max_steps {max_train_steps}, split_scheduler {split_scheduler}")
-    logger.info(f"checkpointing steps {args.checkpointing_steps}")
-    logger.info(f"")
+    # if args.lora:
+    #     from peft import get_peft_model, LoraConfig, TaskType
+    #     target_modules = find_all_linear_names(model)
+    #     my_logger(accelerator, f"LoRA target modules: {target_modules}")
+    #     peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False,
+    #                              r=16, lora_alpha=64, lora_dropout=0.05, target_modules=target_modules)
+    #     model = get_peft_model(model, peft_config)
+    #     model.print_trainable_parameters()
 
-    # # checkpoing resume
-    # if args.resume_from_checkpoint:
-    #     if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-    #         logger.info(f"Resuming from checkpoint {args.resume_from_checkpoint}")
-    #         accelerator.load_state(args.resume_from_checkpoint)
-    #         path = os.path.basename(args.resume_from_checkpoint)
-    #     training_difference = os.path.splitext(path)[0]
+    if args.max_train_steps > 0:
+        max_train_steps = args.max_train_steps
+    else:
+        max_train_steps = train_batches//(gradient_accumulation_steps * num_processes)
 
-    #     resume_step = (
-    #         int(training_difference.replace("step_", ""))
-    #     )
+    # these calculations are done AFTER the accelerator is initialized
+    num_batches_per_device_per_epoch = len(train_loader)
+    grad_updates_per_device_per_epoch = math.ceil(num_batches_per_device_per_epoch / gradient_accumulation_steps)
 
+    epoch_remainder_on_device = num_batches_per_device_per_epoch % gradient_accumulation_steps
+    epoch_remainder_on_device = epoch_remainder_on_device if epoch_remainder_on_device != 0 else gradient_accumulation_steps
 
-    # completed_steps = 0
-    # if args.resume_from_checkpoint and resume_step is not None:
-    #      # TODO this does not work yet
-    #     train_loader = accelerator.skip_first_batches(train_loader, resume_step)
-    #     completed_steps += resume_step
-    #     progress_bar.update(resume_step)
-    #     logger.info(f"Resuming training from step {resume_step}")
+    if num_epochs > 0:
+        total_gradient_updates = min(max_train_steps, grad_updates_per_device_per_epoch * num_epochs * num_processes)
+        total_gradient_updates_per_device = min(math.ceil(max_train_steps // num_processes), grad_updates_per_device_per_epoch * num_epochs)
+    else:
+        total_gradient_updates = max_train_steps
+        total_gradient_updates_per_device = math.ceil(max_train_steps // num_processes)
 
+    # Scheduler
+    if args.lr_schedule == "linear":
+        scheduler = get_linear_schedule_with_warmup(
+            optim, 
+            num_training_steps=max_train_steps,
+            num_warmup_steps=args.warmup_steps
+        )
+    elif args.lr_schedule == "constant":
+        scheduler = get_constant_schedule_with_warmup(
+            optim, 
+            num_warmup_steps=args.warmup_steps
+        )
+
+    split_scheduler = False
+    logger.info("Creating objects from scratch.  Will load checkpoint if specified")
+    # if not loaded_metadata or not loaded_checkpoint:
+    # prepare artifacts - accelerator handles device placement and dataloader splitting
+    model, optim = accelerator.prepare(model, optim)
+    train_loader = accelerator.prepare_data_loader(train_loader, device_placement=True)
+    eval_loader = accelerator.prepare_data_loader(eval_loader, device_placement=True)
     # samples tracking
     epoch = 0
     epoch_step = -1
@@ -662,19 +593,91 @@ def main(args):
     # loss tracking
     cumulative_batch_counter = 0  # number of batches processed since last accumulation
     cumulative_token_counter = 0  # all tokens processed across all processes
+    cumulative_new_token_counter = 0  # all new tokens processed across all processes
 
-    can_train = True
-    if args.save_only:
-        can_train = False
+    if split_scheduler:
+        scheduler = accelerator.prepare(scheduler)
 
-    logger.info(f"Training for {max_train_steps} steps")
+    # Load checkpoint if specified
+    accelerator.register_for_checkpointing(scheduler)
+    
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint == "latest":
+            checkpoint_path = get_latest_checkpoint(output_dir)
+            if checkpoint_path is None:
+                logger.warning("No checkpoints found to resume from. Starting training from scratch.")
+                loaded_checkpoint = False
+            else:
+                try:                    
+                    # Load the state
+                    logger.info(f"Loading accelerator state from {checkpoint_path}")
+                    accelerator.load_state(checkpoint_path)
+                    loaded_checkpoint = True
+                    logger.info(f"Successfully loaded checkpoint from {checkpoint_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load checkpoint: {e}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
+                    loaded_checkpoint = False
+        else:
+            # Load specific checkpoint
+            checkpoint_path = os.path.join(output_dir, args.resume_from_checkpoint)
+            if not os.path.exists(checkpoint_path):
+                raise ValueError(f"Checkpoint path does not exist: {checkpoint_path}")
+            logger.info(f"Loading checkpoint from: {checkpoint_path}")
+
+    logger.info(f"Accelerator state: {accelerator.state}")
+    
     use_progress_bar = True
     progress_bar = tqdm(
         range(total_gradient_updates),
         disable=(not use_progress_bar) or (not accelerator.is_local_main_process),  # turning off progress bar
         # disable=not accelerator.is_local_main_process,
     )
+    # loaded_metadata = False
+    if loaded_checkpoint:
+        try:
+            state_dict = torch.load(os.path.join(checkpoint_path, "checkpoint_meta.json"))
+            resume_step = state_dict["update_step"]
+            epoch = state_dict["epoch"]
+            epoch_step = state_dict["epoch_step"]
+            total_batched_samples = state_dict["total_batched_samples"]
+            cumulative_batch_counter = state_dict["cumulative_batch_counter"]
+            cumulative_token_counter = state_dict["cumulative_token_counter"]
+            cumulative_new_token_counter = state_dict["cumulative_new_token_counter"]
+            update_step = 0
+            train_loader = accelerator.skip_first_batches(train_loader, resume_step)
+            update_step += resume_step
+            progress_bar.update(resume_step)
+            logger.info(f"Resuming training from step {resume_step}")
+        except Exception as e:
+            logger.info(f"Failed to load checkpoint metadata: {checkpoint_path}")
+            logger.info(f"Error: {e}")
 
+    training_iterator = iter(train_loader)
+
+    logger.info(f"max train steps {max_train_steps} ({math.ceil(max_train_steps / num_processes)} per device)")
+    logger.info(f"total gradient updates {total_gradient_updates} ({total_gradient_updates_per_device} per device)")
+    logger.info(f"grad updates per epoch {grad_updates_per_device_per_epoch * num_processes} ({grad_updates_per_device_per_epoch} per device)")
+    logger.info(f"train samples: {train_samples}, batches: {train_batches}, and tokens: {train_loader_token_count}")
+    logger.info(f"train samples per device: {len(train_loader) * args.batch_size}, batches per device: {len(train_loader)}, and tokens (approx): {train_loader_token_count / num_processes}")
+    logger.info(f"eval samples: {eval_samples}, batches: {eval_batches}, and tokens: {eval_loader_token_count}")
+    logger.info(f"eval samples per device: {len(eval_loader) * args.eval_batch_size}, batches per device: {len(eval_loader)}, and tokens (approx): {eval_loader_token_count / num_processes}")
+    logger.info(f"gradient steps {gradient_accumulation_steps}")
+    logger.info(f"per device batch size {args.batch_size}, eval batch size {args.eval_batch_size}")
+    logger.info(f"accelerator distributed type {accelerator.distributed_type}, num_processes {num_processes} on {torch.cuda.get_device_name()}")
+    logger.info(f"effective batch size {total_batch_size}")
+    logger.info(f"learning rate {args.learning_rate}, warmup steps {args.warmup_steps}, schedule_max_steps {max_train_steps}, split_scheduler {split_scheduler}")
+    logger.info(f"checkpointing steps {args.checkpointing_steps}")
+    logger.info(f"")
+
+    can_train = True
+    if args.save_only:
+        can_train = False
+
+    logger.info(f"Training until {max_train_steps} steps")
+
+    materialize_logits = not args.do_not_materialize_logits
     eval_config = {
         "run_lm_eval": args.run_lm_eval,
         "batch_size": args.eval_batch_size,
@@ -682,6 +685,8 @@ def main(args):
         "limit": args.limit,
         "log_samples": args.log_samples,
         "benchmark_tasks": args.benchmark_tasks,
+        "losses_to_track": eval_other_loss_types,
+        "materialize_logits": materialize_logits,
     }
 
     eval_config["tokenizer"] = tokenizer
@@ -692,7 +697,6 @@ def main(args):
     if pre_tok_name is not None:
         eval_config["pre_tok_name"] = pre_tok_name
 
-
     largest_batch_per_device = 0
     while update_step < total_gradient_updates - 1:
         epoch_step += 1
@@ -700,9 +704,9 @@ def main(args):
         logger.debug(f"Starting step {update_step} of {total_gradient_updates}")
         
         # More aggressive memory clearing between steps
-        accelerator.clear()
-        torch.cuda.empty_cache()
-        gc.collect()  # Add garbage collection
+        # accelerator.clear()
+        # torch.cuda.empty_cache()
+        # gc.collect()  # Add garbage collection
         
         if not can_train:
             break
@@ -712,9 +716,10 @@ def main(args):
 
         model.train()
         # TODO add time of each iteration, and memory usage
-        if args.unfreeze_params_steps > 0 and update_step >= args.unfreeze_params_steps:
+        if model_is_frozen and args.unfreeze_params_steps > 0 and update_step >= args.unfreeze_params_steps:
+            logger.info(f"Unfreezing model parameters at step {update_step}")
             model = unfreeze_model(model)
-    
+            model_is_frozen = False
         loss_log = None
         grad_norm = None
         new_embeddings_grad_norm = None
@@ -723,24 +728,25 @@ def main(args):
         batch_samples = []
         num_batches_in_step = gradient_accumulation_steps if epoch_step != (grad_updates_per_device_per_epoch - 1) else epoch_remainder_on_device
         logger.debug(f"gradient accumulation steps: {gradient_accumulation_steps} total gradient updates: {total_gradient_updates}, remainder: {epoch_remainder_on_device}, num_batches_in_step {num_batches_in_step}")
-        for _ in range(num_batches_in_step):
-            batch, training_iterator, epoch = get_next_batch(training_iterator, train_loader, epoch)
-            this_batch = {k: v.cpu() for k, v in batch.items()}
-            batch_samples.append(this_batch)
-            del batch  # Explicitly delete the original batch
+        # for _ in range(num_batches_in_step):
+        #     batch, training_iterator, epoch = get_next_batch(training_iterator, train_loader, epoch)
+        #     this_batch = {k: v.cpu() for k, v in batch.items()}
+        #     batch_samples.append(this_batch)
+        #     del batch  # Explicitly delete the original batch
 
         # get local num items in batch
         device_memory_usage = torch.cuda.memory_allocated() / 1024**2
         logger.debug(f"Step {update_step} - Device {accelerator.process_index} - device memory usage {device_memory_usage} MB, largest_batch_per_device {largest_batch_per_device}", main_process_only=False)
 
-        accumulated_losses = []
-        accumulated_losses_new_tokens = []
-        accumulated_token_counts = []
         accumulation_batch_counter = 0
-        new_token_counter = []
-        # logger.debug(f"batch_samples length: {len(batch_samples)}, batch_samples[0]: {batch_samples[0]}, context len: {batch_samples[0]['input_ids'].shape[1]}", main_process_only=True)
+        new_token_counter = 0
+        total_token_counter = 0
+        accumulated_losses_per_loss_type = defaultdict(list)
+        accumulated_tokens_per_loss_type = defaultdict(list)
         
-        for i, batch in enumerate(batch_samples):
+        # for i, batch in enumerate(batch_samples):
+        for i in range(num_batches_in_step):
+            batch, training_iterator, epoch = get_next_batch(training_iterator, train_loader, epoch)
             total_batched_samples += 1
             # Move batch to device just before use
             batch = {k: v.to(accelerator.device) for k, v in batch.items()}
@@ -756,24 +762,29 @@ def main(args):
             # but the gradients accumulate across all processes.
             # therefore you dont need to only do grad.step() on the main process/sync step because it knows   
             with accelerator.accumulate(model):  # Use accelerator's context manager
-                # Call the forward_pass function
-                main_loss, translated_loss, new_tokens_loss, num_items_in_batch, num_new_tokens_in_batch = forward_pass(
-                    model, batch, original_vocab_size
+                main_loss, tracked_losses, num_items_for_loss, tracked_tokens_per_loss_type = forward_pass(
+                    model, batch, loss_with_grad=main_loss_type, losses_without_grad=other_loss_types, materialize_logits=materialize_logits
                 )
 
                 mem_before_backward = torch.cuda.memory_allocated() / 1024**2
                 logger.debug(f"Memory before backwards pass opt_step: {update_step} accum_step:{i} - Device {accelerator.process_index}: {mem_before_backward:.2f} MB", main_process_only=False)
                 accelerator.backward(main_loss)
 
-                # Accumulate losses and other metrics
-                accumulated_losses.append(main_loss.item())
-                accumulated_losses_new_tokens.append(new_tokens_loss.item())
-                accumulated_token_counts.append(num_items_in_batch)
-                accumulation_batch_counter += 1
-                new_token_counter.append(num_new_tokens_in_batch)
+                # just copy this into the dict so we have all the info there
+                tracked_losses[main_loss_type] = main_loss.item()
+                tracked_tokens_per_loss_type[main_loss_type] = num_items_for_loss
 
-                del outputs
-                del loss
+                num_new_tokens_in_batch = tracked_tokens_per_loss_type.get("new_tokens", 0)
+                num_items_in_batch = tracked_tokens_per_loss_type.get("all", 0)
+
+                accumulation_batch_counter += 1
+                new_token_counter += num_new_tokens_in_batch
+                total_token_counter += num_items_in_batch
+                for loss_type in tracked_losses:
+                    accumulated_losses_per_loss_type[loss_type].append(tracked_losses[loss_type])
+                    accumulated_tokens_per_loss_type[loss_type].append(tracked_tokens_per_loss_type[loss_type])
+
+                del main_loss, tracked_losses, num_items_for_loss, tracked_tokens_per_loss_type
                 # torch.cuda.empty_cache()  # Consider moving this outside the loop
                 
                 if accelerator.sync_gradients:
@@ -791,9 +802,8 @@ def main(args):
                     scheduler.step()
                     
                 optim.zero_grad()
-                # logger.info(f"losses: {accumulated_losses} accumulated_token_counts: {accumulated_token_counts}  accumulated_batch_counter: {accumulation_batch_counter} grad_norm: {grad_norm} learning rate: {scheduler.get_last_lr()[0]}", main_process_only=False)
     
-        accelerator.clear()
+        # accelerator.clear()
         torch.cuda.empty_cache()
                 
         if accelerator.sync_gradients:
@@ -803,67 +813,78 @@ def main(args):
                         f"Our counter: {accumulation_batch_counter}")
 
             gathered_metrics_list = [
-                accumulated_losses,
-                accumulated_losses_new_tokens,
-                accumulated_token_counts,
                 accumulation_batch_counter,
-                new_token_counter
+                new_token_counter,
+                total_token_counter,
+                accumulated_losses_per_loss_type,
+                accumulated_tokens_per_loss_type,
             ]
             # All processes must participate in gather
             gathered_metrics = accelerator.gather_for_metrics(gathered_metrics_list)
 
-            if accelerator.is_local_main_process:
-                num_gathered_metrics = len(gathered_metrics)
+            if accelerator.is_main_process:
+                num_gathered_metrics = len(gathered_metrics_list)
+
                 # Regroup the metrics by type
-                gathered_losses = [item for sublist in gathered_metrics[0::num_gathered_metrics] for item in sublist]
-                gathered_losses_new_tokens = [item for sublist in gathered_metrics[1::num_gathered_metrics] for item in sublist]
-                gathered_tokens = [item for sublist in gathered_metrics[2::num_gathered_metrics] for item in sublist]
-                gathered_batch_counter = sum(gathered_metrics[3::num_gathered_metrics])
-                gathered_new_token_counter = [item for sublist in gathered_metrics[4::num_gathered_metrics] for item in sublist]
+                gathered_batch_counter = sum(gathered_metrics[0::num_gathered_metrics])
+                gathered_new_token_counter = sum(gathered_metrics[1::num_gathered_metrics])
+                gathered_total_token_counter = sum(gathered_metrics[2::num_gathered_metrics])
+
+                all_gathered_losses = defaultdict(list)
+                all_gathered_tokens = defaultdict(list)
+
+                gathered_losses = gathered_metrics[3::num_gathered_metrics]
+                for loss_dict in gathered_losses:
+                    for loss_type, loss_val in loss_dict.items():
+                        all_gathered_losses[loss_type].extend(loss_val)
+
+                gathered_tokens = gathered_metrics[4::num_gathered_metrics]
+                for token_dict in gathered_tokens:
+                    for loss_type, token_count in token_dict.items():
+                        all_gathered_tokens[loss_type].extend(token_count)
                 
-                # Aggregate loss
-                batch_sum_weighted_loss = 0
-                batch_total_tokens = 0
-                for loss, tokens in zip(gathered_losses, gathered_tokens):
-                    batch_sum_weighted_loss += loss * tokens
-                    batch_total_tokens += tokens
+                losses_dict = {}
+                for loss_type in all_gathered_losses.keys():
+                    losses = all_gathered_losses[loss_type]
+                    tokens = all_gathered_tokens[loss_type]
 
-                avg_loss = sum(gathered_losses) / len(gathered_losses)
-                weighted_avg_loss = batch_sum_weighted_loss / batch_total_tokens
-                cumulative_token_counter += batch_total_tokens
+                    batch_sum_weighted_loss = 0
+                    batch_total_tokens = 0
+                    for loss, tok in zip(losses, tokens):
+                        batch_sum_weighted_loss += loss * tok
+                        batch_total_tokens += tok
+
+                    weighted_avg_loss = batch_sum_weighted_loss / batch_total_tokens
+                    avg_loss = sum(losses) / len(losses)
+
+                    losses_dict[f"{loss_type}_weighted_loss"] = weighted_avg_loss
+                    losses_dict[f"{loss_type}_loss"] = avg_loss
+
+
+                cumulative_token_counter += gathered_total_token_counter
                 cumulative_batch_counter += gathered_batch_counter
+                cumulative_new_token_counter += gathered_new_token_counter
 
-                # aggregate loss for new tokens
-                batch_sum_weighted_loss_new_tokens = 0
-                batch_total_tokens_new_tokens = 0
-                for loss, tokens in zip(gathered_losses_new_tokens, gathered_new_token_counter):
-                    batch_sum_weighted_loss_new_tokens += loss * tokens
-                    batch_total_tokens_new_tokens += tokens
-
-                avg_loss_new_tokens = sum(gathered_losses_new_tokens) / len(gathered_losses_new_tokens)
-                weighted_avg_loss_new_tokens = batch_sum_weighted_loss_new_tokens / batch_total_tokens_new_tokens
 
                 # Create metrics dict
                 metrics_dict = {
-                    "loss": avg_loss,
-                    "weighted_loss": weighted_avg_loss,
-                    "loss_new_tokens": avg_loss_new_tokens,
-                    "weighted_loss_new_tokens": weighted_avg_loss_new_tokens,
-                    "token_counter": batch_total_tokens,
+                    # "loss": avg_loss,
+                    # "weighted_loss": weighted_avg_loss,
+                    **losses_dict,
+                    "token_counter": gathered_total_token_counter,
                     "cum_token_counter": cumulative_token_counter,
+                    "new_token_counter": gathered_new_token_counter,
+                    "cum_new_token_counter": cumulative_new_token_counter,
                     "batch_counter": gathered_batch_counter,
                     "cum_batch_counter": cumulative_batch_counter,
                     "lr": scheduler.get_last_lr()[0],
                     "grad_norm": grad_norm,
                     "new_embeddings_grad_norm": new_embeddings_grad_norm,
-                    "num_new_tokens": sum(gathered_new_token_counter)
                 }
                 metrics_dict = {f"train_{k}": v for k, v in metrics_dict.items()}
                 metrics_dict["step"] = update_step
                 metrics_dict["epoch"] = epoch
-                loss_log = {
-                    "loss": avg_loss,
-                }
+                loss_log = {k: v for k, v in losses_dict.items() if not k.endswith("_weighted_loss")}
             
                 log_loss(metrics_dict, output_dir)
                 if args.wandb:
@@ -876,24 +897,53 @@ def main(args):
                         progress_bar.set_postfix(loss_log)  # This will now show both raw loss and moving average
                     else:
                         logger.info(metrics_dict)
+                
+                del gathered_metrics
+                del metrics_dict
+                del all_gathered_losses
+                del all_gathered_tokens
+                del losses_dict
+                del loss_log
+                gc.collect()
 
-                # checkpointing
-                if save_model_type == "all" and isinstance(args.checkpointing_steps, int) and update_step > 0:
-                    if update_step % args.checkpointing_steps == 0:
-                        logger.info(f"Checkpointing step {update_step}")
-                        # output_dir_ext = f"step_{update_step}"
-                        output_dir_ext = f"intermediate_model"
-                        output_dir_path = os.path.join(output_dir, output_dir_ext)
-                        accelerator.save_state(output_dir_path)
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        unwrapped_model.save_pretrained(
-                            output_dir_path,
-                            is_main_process=accelerator.is_main_process,
-                            save_function=accelerator.save,
-                            # state_dict=state_dict,
-                        )
-
-            del gathered_metrics
+            # checkpointing (outsize main process)
+            if save_model_type == "all" and isinstance(args.checkpointing_steps, int) and update_step > 0:
+                if update_step % args.checkpointing_steps == 0:
+                    logger.info(f"Checkpointing step {update_step}", main_process_only=False)
+                    
+                    # Delete previous checkpoints before saving new one
+                    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+                    if accelerator.is_main_process and os.path.exists(checkpoint_dir):
+                        checkpoint_prefix = "checkpoint"
+                        checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith(checkpoint_prefix)]
+                        for checkpoint in checkpoints:
+                            checkpoint_path = os.path.join(checkpoint_dir, checkpoint)
+                            logger.debug(f"Removing old checkpoint: {checkpoint_path}", main_process_only=False)
+                            try:
+                                shutil.rmtree(checkpoint_path)
+                            except Exception as e:
+                                logger.warning(f"Error removing checkpoint {checkpoint_path}: {e}")
+                    accelerator.wait_for_everyone()
+                    save_location = accelerator.save_state()  # accelerator handles state name
+                    state_dict = {
+                        "update_step": update_step,
+                        "epoch": epoch,
+                        "epoch_step": epoch_step,
+                        "update_step": update_step,
+                        "total_batched_samples": total_batched_samples,
+                        "cumulative_batch_counter": cumulative_batch_counter,
+                        "cumulative_token_counter": cumulative_token_counter,
+                        "cumulative_new_token_counter": cumulative_new_token_counter,
+                    }
+                    torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.json"))
+                    
+                    # unwrapped_model = accelerator.unwrap_model(model)
+                    # unwrapped_model.save_pretrained(
+                    #     output_dir_path,
+                    #     is_main_process=accelerator.is_main_process,
+                    #     save_function=accelerator.save,
+                    #     # state_dict=state_dict,
+                    # )
     
             if update_step % args.eval_steps == 0:
                 logger.debug(f"EVAL:Step {update_step}: Starting evaluation")
@@ -901,7 +951,8 @@ def main(args):
                 torch.cuda.empty_cache()
                 eval_metrics_dict = evaluate(model, eval_loader, accelerator, args.eval_iters, eval_config)
                 move_optimizer_to_gpu(optim)
-                logger.debug(f"EVAL:Step {update_step}: Eval Loss = {eval_metrics_dict['loss']:.4f}, Weighted Eval Loss = {eval_metrics_dict['weighted_loss']:.4f}")
+                log_dict = {k: v for k, v in eval_metrics_dict.items() if not k.endswith("_weighted_loss")}
+                logger.debug(f"EVAL:Step {update_step}: Eval Loss = {log_dict[f'{main_loss_type}_loss']:.4f}")
 
                 eval_metrics_dict = {f"eval_{k}": v for k, v in eval_metrics_dict.items()}
                 eval_metrics_dict["step"] = update_step
@@ -913,12 +964,10 @@ def main(args):
                 
                     logger.debug(eval_metrics_dict)
                 #TODO  add early stopping
+        accumulated_losses_per_loss_type.clear()
+        accumulated_tokens_per_loss_type.clear()
     
     logger.info(f"Training Finished")
-
-    accelerator.clear()  # This clears the accelerator's internal state
-
-    torch.cuda.empty_cache()
     
     # Make sure all processes are synced
     accelerator.wait_for_everyone()    
@@ -929,24 +978,10 @@ def main(args):
         if not check_disk_space(output_dir, required_space_gb=20):
             logger.info("Aborting save due to insufficient disk space")
             return
-        
-        # if torch.distributed.is_initialized():
-        #     accelerator.wait_for_everyone()
-
-        # if args.deepspeed:
-        #     state_dict = accelerator.get_state_dict(model)
-        # else:
-        #     full_state_dict_config = FullStateDictConfig(
-        #         offload_to_cpu=True, rank0_only=True)
-        #     # with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
-        #     #     state_dict = accelerator.get_state_dict(model, unwrap=False)
-        #     state_dict = FSDP.get_state_dict(model, state_dict_config=full_state_dict_config)
-        #     # with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
-        #     #     state_dict = model.state_dict()
 
         output_dir_ext = f"final_model"
         output_dir_path = os.path.join(output_dir, output_dir_ext)
-        accelerator.save_state(output_dir_path)
+        # accelerator.save_state(output_dir_path)  # no need to save state on final model
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.save_pretrained(
             output_dir_path,
@@ -954,11 +989,24 @@ def main(args):
             save_function=accelerator.save,
             # state_dict=state_dict,
         )
+        lm_eval_string = get_lm_eval_string(output_dir_path, 
+                                            tokenizer.name_or_path, 
+                                            tasks=eval_config["benchmark_tasks"],
+                                            num_fewshot=eval_config["num_fewshot"],
+                                            limit=eval_config["limit"],
+                                            log_samples=eval_config["log_samples"],
+                                            cache_requests=eval_config["cache_requests"],
+                                            show_config=eval_config["show_config"],
+                                            )
+        
+        with open(os.path.join(output_dir, "lm_eval.sh"), "w") as f:
+            f.write(lm_eval_string)
 
         # Clear memory before final evaluation
         accelerator.clear()
         torch.cuda.empty_cache()
         gc.collect()
+        del unwrapped_model
 
         # Move optimizer to CPU and clear GPU memory
         move_optimizer_to_cpu(optim)
@@ -967,7 +1015,8 @@ def main(args):
         # Run final evaluation
         eval_metrics_dict = evaluate(model, eval_loader, accelerator, args.eval_iters, eval_config)
         # move_optimizer_to_gpu(optim)
-        logger.debug(f"EVAL FINAL: Eval Loss = {eval_metrics_dict['loss']:.4f}, Weighted Eval Loss = {eval_metrics_dict['weighted_loss']:.4f}")
+        log_dict = {k: v for k, v in eval_metrics_dict.items() if not k.endswith("_weighted_loss")}
+        logger.debug(f"EVAL:Step {update_step}: Eval Loss = {log_dict[f'{main_loss_type}_loss']:.4f}")
 
         eval_metrics_dict = {f"eval_{k}": v for k, v in eval_metrics_dict.items()}
         eval_metrics_dict["step"] = update_step
@@ -983,12 +1032,11 @@ def main(args):
 
     # Clear everything before ending training
     del model
-    del unwrapped_model
     del optim
     del eval_loader
     del train_loader
-    accelerator.clear()
-    torch.cuda.empty_cache()
+    # accelerator.clear()
+    # torch.cuda.empty_cache()
     gc.collect()
 
     # Make sure all processes are synced before ending
@@ -1005,10 +1053,11 @@ if __name__ == "__main__":
 
     # implementation params
     args.add_argument("--dry-run", action="store_true")
-    args.add_argument("--batch-size", type=int, default=1)
+    args.add_argument("--logging-mode", type=str, choices=["INFO", "DEBUG"], default="INFO")
     args.add_argument("--cpu-batch-size", type=int, default=1000)
     args.add_argument("--checkpointing-steps", type=int)
-    args.add_argument("--resume-from-checkpoint", type=str)  # TODO
+    args.add_argument("--resume-from-checkpoint", type=str, default="latest",
+                     help="Path to checkpoint directory or 'latest' to let accelerate handle latest")
     args.add_argument("--wandb", type=str)
     args.add_argument("--wandb-tags", type=str)
     args.add_argument("--seed", type=int, default=42)
@@ -1022,7 +1071,9 @@ if __name__ == "__main__":
                     help="Whether to save the model after training")
 
     # finetuning params
-    args.add_argument("--dataset", type=str, default="emozilla/pg_books-tokenized-bos-eos-chunked-65536")
+    args.add_argument("--dataset", type=str, default=None)
+    args.add_argument("--total-batch-size", type=int, default=None)
+    args.add_argument("--batch-size", type=int, default=1)
     args.add_argument("--gradient-accumulate-every", type=int, default=8)
     args.add_argument("--max-train-steps", type=int, default=-1)
     args.add_argument("--num-epochs", type=int, default=-1)
@@ -1033,6 +1084,7 @@ if __name__ == "__main__":
                       choices=["SFT", "translation", "mixed"],
                       default="SFT",
                       help="Whether to finetune the model parameters")
+    
     # positional embeddings
     args.add_argument("--scaling-factor", type=float, default=16.0) # TODO
     args.add_argument("--scaling-type", type=str, default="yarn") # TODO
@@ -1057,13 +1109,24 @@ if __name__ == "__main__":
                      choices=["default", "random", "clone", "mean", "zeros", "merge", None],
                      default=None,
                      help="Strategy for initializing new token embeddings")
-    args.add_argument("--finetuning-params", type=str,
+    args.add_argument("--finetune-params", type=str,
                       choices=["full", "embeddings", "new_tokens_only"],
                       default="full",
                       help="Whether to finetune the model parameters")
     args.add_argument("--unfreeze-params-steps", type=int,
                     default=-1,
                     help="Steps to switch to finetuning params")
+    args.add_argument("--main-loss", type=str,
+                      choices=["all", "translated", "new_tokens", None],
+                      default=None,
+                      help="Whether to backpropagate on all losses or just some")
+    args.add_argument("--train-losses-to-track", type=str,
+                      default=None,
+                      help="List of losses to track on during evaluation")
+    args.add_argument("--eval-losses-to-track", type=str,
+                      default=None,
+                      help="Whether to backpropagate on all losses or just some")
+
 
     # EVAL PARAMS
     args.add_argument("--eval-steps", type=int, default=1000,
@@ -1082,11 +1145,48 @@ if __name__ == "__main__":
                      help="store actual samples from benchmark")
     args.add_argument("--benchmark-tasks", type=str, default="minerva_math",
                      help="Benchmark tasks to run")
+    args.add_argument("--do-not-materialize-logits", action="store_true",
+                     help="Whether to not materialize logits for additional time savings")
     
     args = args.parse_args()
+
+    # some config validation
+    args.wandb_tags = args.wandb_tags.split(",") if args.wandb_tags else None
+
+    # loss tracking
+
+    allowed_loss_types = ["all", "translated", "new_tokens"]
+    train_losses_to_track = args.train_losses_to_track.split(",") if args.train_losses_to_track else []
+    for loss_type in train_losses_to_track:
+        if loss_type not in allowed_loss_types:
+            raise ValueError(f"Invalid train loss type: {loss_type}")
+    args.train_losses_to_track = train_losses_to_track
+        
+    eval_losses_to_track = args.eval_losses_to_track.split(",") if args.eval_losses_to_track else []
+    for loss_type in eval_losses_to_track:
+        if loss_type not in allowed_loss_types:
+            raise ValueError(f"Invalid eval loss type: {loss_type}")
+        
+    if args.task_name == "translation":
+        if "translated" not in eval_losses_to_track:
+            eval_losses_to_track.append("translated")
+        # if "new_tokens" not in args.eval_losses_to_track:
+        #     eval_losses_to_track.append("new_tokens")
+    args.eval_losses_to_track = eval_losses_to_track
+
+    if args.main_loss == None:
+        args.main_loss = "all"
+        if args.task_name == "SFT":
+            args.main_loss = "all"
+        elif args.task_name == "translation":
+            args.main_loss = "translated"
+        elif args.task_name == "mixed":
+            raise NotImplementedError("Mixed task name not implemented")
+        else:
+            raise ValueError(f"Invalid task name: {args.task_name}")
 
     main(args)
 
     # TODO consider training params:
-    # - grad norm
     # - lora
+    # - checkpointing

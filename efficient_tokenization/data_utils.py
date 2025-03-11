@@ -1,7 +1,33 @@
 import torch
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
+from torch.utils.data import DataLoader
 
+def find_optimal_batch_size(model, initial_batch_size, tokenizer, accelerator):
+    """Dynamically find the largest batch size that fits in memory"""
+    batch_size = initial_batch_size
+    while batch_size > 1:
+        try:
+            # Create a sample batch
+            sample_input = tokenizer("test" * 100, return_tensors="pt", padding=True)
+            sample_input = {k: v.repeat(batch_size, 1).to(accelerator.device) for k, v in sample_input.items()}
+            
+            # Test forward and backward pass
+            with torch.cuda.amp.autocast():
+                outputs = model(**sample_input)
+                loss = outputs.loss
+                accelerator.backward(loss)
+            
+            del outputs, loss
+            torch.cuda.empty_cache()
+            return batch_size
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                batch_size //= 2
+                torch.cuda.empty_cache()
+            else:
+                raise e
+    return 1
 
 @dataclass
 class MyPaddingCollator:
@@ -156,3 +182,18 @@ class MyPaddingCollatorWithLossMask:
         }
         
         return batch
+
+
+def create_memory_efficient_loader(dataset, batch_size, collate_fn, num_proc):
+    """Create a memory-efficient data loader"""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        prefetch_factor=2,  # Reduce prefetching
+        # persistent_workers=True,  # THIS throws an error
+        num_workers=num_proc  # Adjust based on CPU cores
+    )
+

@@ -76,6 +76,7 @@ def main(args):
         logger.info(f"Tokenizing dataset")
         ds = my_tokenize(ds.select_columns("text"), tokenizer, args.cpu_batch_size, args.num_proc)
         changed_dataset = True
+        logger.info(f"Tokenized dataset")
     else:
         logger.info(f"Dataset already tokenized")
 
@@ -97,6 +98,7 @@ def main(args):
             batch_size=args.cpu_batch_size
         )
         changed_dataset = True
+        logger.info(f"Added labels")
     else:
         logger.info(f"Dataset already has labels")
 
@@ -115,6 +117,7 @@ def main(args):
             batch_size=args.cpu_batch_size
         )
         changed_dataset = True
+        logger.info(f"Added attention mask")
     else:
         logger.info(f"Dataset already has attention mask")
 
@@ -142,6 +145,7 @@ def main(args):
     if "num_tokens" not in ds.column_names:
         ds = ds.map(lambda batch: {"num_tokens": [len(ids) for ids in batch["input_ids"]]}, batched=True, batch_size=args.cpu_batch_size, num_proc=args.num_proc)
         changed_dataset = True
+        logger.info(f"Added num_tokens")
     else:
         logger.info(f"Dataset already has num_tokens")
 

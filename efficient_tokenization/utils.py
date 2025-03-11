@@ -3,7 +3,7 @@ import shutil
 import logging
 from accelerate.state import AcceleratorState
 from accelerate.logging import get_logger
-
+import torch
 
 def setup_logging(log_level=logging.INFO):
     """Setup global logging configuration"""
@@ -13,17 +13,20 @@ def setup_logging(log_level=logging.INFO):
         level=log_level,
         force=True  # This ensures we override any existing configuration
     )
-    if AcceleratorState().initialized:
-        ll = logging.getLevelName(log_level)
-        logger = get_logger(__name__)
-        logger.setLevel(ll)
-    else:
+    try:
+        if AcceleratorState().initialized:
+            ll = logging.getLevelName(log_level)
+            logger = get_logger(__name__)
+            logger.setLevel(ll)
+        else:
+            logger = logging.getLogger(__name__)  # if you want to see for all ranks
+    except:
         logger = logging.getLogger(__name__)  # if you want to see for all ranks
+        logger.info("AcceleratorState not initialized")
     
     return logger
 
-logger = setup_logging()
-
+logger = logging.getLogger(__name__)  # if you want to see for all ranks
 
 def get_directory_size(directory):
     """Calculate the total size of a directory in bytes."""
@@ -41,6 +44,7 @@ def format_size(bytes):
         if bytes < 1024:
             return f"{bytes:.2f} {unit}"
         bytes /= 1024
+
 
 def check_disk_space(directory, required_space_gb=10):
     """
@@ -77,3 +81,13 @@ def check_disk_space(directory, required_space_gb=10):
     except Exception as e:
         logger.error(f"Error checking disk space: {str(e)}")
         return False
+
+def log_memory_usage(step, phase, accelerator):
+    """Log memory usage at various points in training"""
+    if accelerator.is_local_main_process:
+        gpu_memory_allocated = torch.cuda.memory_allocated() / 1024**2
+        gpu_memory_reserved = torch.cuda.memory_reserved() / 1024**2
+        logger.info(f"Step {step} - {phase} - "
+                   f"GPU Memory Allocated: {gpu_memory_allocated:.2f}MB, "
+                   f"Reserved: {gpu_memory_reserved:.2f}MB")
+
