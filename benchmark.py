@@ -18,7 +18,7 @@ def compile_eval_scripts(base_dir, output_bash_file):
                         line = f.read().strip()
                         bash_file.write(line + "\n")
                     eval_scripts.append(subdir_path)
-
+                    print(f"Found lm_eval.sh in {subdir_path}")
                 else:
                     # Check if 'final_model' subfolder exists
                     final_model_path = os.path.join(subdir_path, "final_model")

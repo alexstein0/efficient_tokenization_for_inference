@@ -4,6 +4,8 @@ import logging
 from accelerate.state import AcceleratorState
 from accelerate.logging import get_logger
 import torch
+import json
+import hashlib
 
 def setup_logging(log_level=logging.INFO):
     """Setup global logging configuration"""
@@ -14,12 +16,10 @@ def setup_logging(log_level=logging.INFO):
         force=True  # This ensures we override any existing configuration
     )
     try:
-        if AcceleratorState().initialized:
-            ll = logging.getLevelName(log_level)
-            logger = get_logger(__name__)
-            logger.setLevel(ll)
-        else:
-            logger = logging.getLogger(__name__)  # if you want to see for all ranks
+        ll = logging.getLevelName(log_level)
+        logger = get_logger(__name__)
+        logger.setLevel(ll)
+        logger.info("Initialized logger")
     except:
         logger = logging.getLogger(__name__)  # if you want to see for all ranks
         logger.info("AcceleratorState not initialized")
@@ -90,4 +90,17 @@ def log_memory_usage(step, phase, accelerator):
         logger.info(f"Step {step} - {phase} - "
                    f"GPU Memory Allocated: {gpu_memory_allocated:.2f}MB, "
                    f"Reserved: {gpu_memory_reserved:.2f}MB")
+
+
+def generate_hashed_dir_name(params_dict, output_folder="output", dry_run=False):
+    # Serialize the dictionary of parameters in a deterministic way
+    params_json = json.dumps(params_dict, sort_keys=True).encode()
+    params_hash = hashlib.md5(params_json).hexdigest()[:8]  # 8 chars short hash
+
+    output_dir = f"{params_hash}-{params_dict['model_name']}-{params_dict['task_name']}"
+    
+    if dry_run:
+        output_dir = f"dryrun-{output_dir}"
+    
+    return os.path.join(output_folder, output_dir)
 

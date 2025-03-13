@@ -2,9 +2,18 @@ import os
 import json
 import pandas as pd
 
+def get_model_info(model_path):
+    config_path = os.path.join(model_path, 'train_config.json')
+    if not os.path.exists(config_path):
+        return {}
+    
+    with open(config_path, 'r') as f:
+        data = json.load(f)
+    return data
 
 def crawl_and_load_json_to_df(base_dir):
     records = []
+    model_dir = "output"
 
     for root, _, files in os.walk(base_dir):
         for file in files:
@@ -14,6 +23,9 @@ def crawl_and_load_json_to_df(base_dir):
                     data = json.load(f)
 
                 model_name = data.get("model_name_sanitized", "unknown")
+                model_path = data.get("model_path", "unknown")
+                train_config_path = os.path.join(model_dir, model_path)
+                train_config = get_model_info(train_config_path)
 
                 results = data.get("results", {})
 
@@ -24,7 +36,8 @@ def crawl_and_load_json_to_df(base_dir):
                         "exact_match": task_results.get("exact_match,none"),
                         "exact_match_stderr": task_results.get("exact_match_stderr,none"),
                         "alias": task_results.get("alias"),
-                        "json_path": full_path
+                        "json_path": full_path,
+                        **train_config
                     }
                     records.append(record)
 

@@ -1,7 +1,7 @@
 import torch
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
 
 def find_optimal_batch_size(model, initial_batch_size, tokenizer, accelerator):
     """Dynamically find the largest batch size that fits in memory"""
@@ -184,16 +184,25 @@ class MyPaddingCollatorWithLossMask:
         return batch
 
 
-def create_memory_efficient_loader(dataset, batch_size, collate_fn, num_proc):
+def create_memory_efficient_loader(dataset, batch_size, collate_fn, num_proc, accelerator=None, shuffle=True):
     """Create a memory-efficient data loader"""
-    return DataLoader(
+    # if accelerator is not None and accelerator.num_processes > 1:
+    # sampler = DistributedSampler(dataset)
+    # else:
+    # single GPU
+    if shuffle:
+        sampler = RandomSampler(dataset)
+    else:
+        sampler = torch.utils.data.SequentialSampler(dataset)        
+    loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=sampler,
+        # shuffle=shuffle,
         collate_fn=collate_fn,
         pin_memory=True,
         prefetch_factor=2,  # Reduce prefetching
         # persistent_workers=True,  # THIS throws an error
         num_workers=num_proc  # Adjust based on CPU cores
     )
-
+    return loader, sampler

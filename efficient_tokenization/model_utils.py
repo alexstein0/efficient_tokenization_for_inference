@@ -1,6 +1,25 @@
 import torch
 from typing import Dict, List, Tuple
+import os
+import shutil
 
+def save_checkpoint(accelerator, output_dir, state_dict, logger):
+    # Delete previous checkpoints before saving new one
+    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    if accelerator.is_main_process and os.path.exists(checkpoint_dir):
+        checkpoint_prefix = "checkpoint"
+        checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith(checkpoint_prefix)]
+        for checkpoint in checkpoints:
+            checkpoint_path = os.path.join(checkpoint_dir, checkpoint)
+            logger.debug(f"Removing old checkpoint: {checkpoint_path}", main_process_only=False)
+            try:
+                shutil.rmtree(checkpoint_path)
+            except Exception as e:
+                logger.warning(f"Error removing checkpoint {checkpoint_path}: {e}")
+    accelerator.wait_for_everyone()
+    save_location = accelerator.save_state()  # accelerator handles state name
+
+    torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.pt"))
 
 def calculate_grad_norm(parameters, norm_type=2.0, error_if_nonfinite=False, foreach=None, is_grad=False):
     if isinstance(parameters, torch.Tensor):
@@ -30,43 +49,42 @@ def find_all_linear_names(model):
     return list(lora_module_names)
 
 
-@torch.no_grad()
 def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor], new_tokens_mask: torch.Tensor, loss_types: List[str], materialize_logits: bool = True) -> Tuple[Dict[str, float], Dict[str, int]]:
-    
-    if materialize_logits:
-        outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False)  # called without labels to get the logits
-        logits = outputs.logits
-        loss_function = model.module.loss_function
-
-    
-    # Initialize a dictionary to store the losses for each type
+    model.eval()
     losses = {}
     num_tokens_per_loss_type = {}
-    for loss_type in loss_types:
-        # Determine the labels based on the loss type
-        if loss_type == "all": 
-            labels = batch["labels"]
-        elif loss_type == "translated":
-            if "loss_mask" not in batch:
-                raise ValueError("loss_mask not in batch")
-            labels = batch["labels"].clone()
-            labels[batch["loss_mask"] == 0] = -100
-        elif loss_type == "new_tokens":
-            labels = batch["labels"].clone()
-            labels[new_tokens_mask] = -100
-        else:
-            raise ValueError(f"Invalid loss_type: {loss_type}")
-        
+    
+    with torch.no_grad():
         if materialize_logits:
-            # Calculate the loss using the model's loss function
-            loss = loss_function(logits, labels, vocab_size=model.module.config.vocab_size)
-        else:
-            outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=labels, use_cache=False)
-            loss = outputs.loss
-        
-        # Store the loss in the dictionary
-        losses[loss_type] = loss.item()
-        num_tokens_per_loss_type[loss_type] = (labels.ne(-100)).sum().item()
+            outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False)
+            logits = outputs.logits
+            loss_function = model.module.loss_function
+
+        for loss_type in loss_types:
+            # Determine the labels based on the loss type
+            if loss_type == "all": 
+                labels = batch["labels"]
+            elif loss_type == "translated":
+                if "loss_mask" not in batch:
+                    raise ValueError("loss_mask not in batch")
+                labels = batch["labels"].clone()
+                labels[batch["loss_mask"] == 0] = -100
+            elif loss_type == "new_tokens":
+                labels = batch["labels"].clone()
+                labels[new_tokens_mask] = -100
+            else:
+                raise ValueError(f"Invalid loss_type: {loss_type}")
+            
+            if materialize_logits:
+                # Calculate the loss using the model's loss function
+                loss = loss_function(logits, labels, vocab_size=model.module.config.vocab_size)
+            else:
+                outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=labels, use_cache=False)
+                loss = outputs.loss
+            
+            # Store the loss in the dictionary
+            losses[loss_type] = loss.item()
+            num_tokens_per_loss_type[loss_type] = (labels.ne(-100)).sum().item()
 
     return losses, num_tokens_per_loss_type
 
@@ -107,7 +125,11 @@ def forward_pass(model, batch: Dict[str, torch.Tensor], loss_with_grad: str = "a
 
         num_items_for_loss = (labels.ne(-100)).sum().item()
 
-    tracked_losses, tracked_num_tokens = calc_loss_without_grad(model, batch, new_tokens_mask, losses_without_grad, materialize_logits=materialize_logits)
+    if len(losses_without_grad) > 0:
+        tracked_losses, tracked_num_tokens = calc_loss_without_grad(model, batch, new_tokens_mask, losses_without_grad, materialize_logits=materialize_logits)
+    else:
+        tracked_losses = {}
+        tracked_num_tokens = {}
 
     # makes sure these are always tracked
     tracked_num_tokens["new_tokens"] = (new_tokens_mask.sum().item())

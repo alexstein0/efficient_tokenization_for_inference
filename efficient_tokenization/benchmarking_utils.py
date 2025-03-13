@@ -10,7 +10,7 @@ def get_lm_eval_string(output_dir: str,
                        num_fewshot: int = -1,
                        ) -> str:
     return f"""accelerate launch --num_processes {num_processes} -m lm_eval \
-    --model_args pretrained={output_dir}/final_model,tokenizer={tokenizer_path} \
+    --model_args pretrained={output_dir},tokenizer={tokenizer_path} \
     --gen_kwargs do_sample=True,temperature=0.7,top_p=3 \
     --tasks {",".join(tasks)} \
     --batch_size auto \
