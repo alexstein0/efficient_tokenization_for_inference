@@ -19,6 +19,7 @@ import math
 from typing import Any, Dict, List, Union
 from collections import defaultdict
 
+import socket
 from accelerate.logging import get_logger
 import logging
 import json
@@ -28,8 +29,8 @@ import psutil
 from efficient_tokenization.tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer
 from efficient_tokenization.extend_embeddings import extend_model_embeddings, initialize_new_embeddings, get_new_embedding_params, get_new_embeddings_grads, unfreeze_model, freeze_model_except_embeddings, freeze_old_embeddings
 from efficient_tokenization.data_utils import MyPaddingCollator, MyPaddingCollatorWithLossMask, create_memory_efficient_loader
-from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name
-from efficient_tokenization.model_utils import forward_pass, move_optimizer_to_cpu, move_optimizer_to_gpu, calculate_grad_norm, save_checkpoint
+from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name, get_cpus
+from efficient_tokenization.model_utils import forward_pass, move_optimizer_to_cpu, move_optimizer_to_gpu, calculate_grad_norm, save_checkpoint, remove_old_checkpoints
 from efficient_tokenization.benchmarking_utils import get_lm_eval_string
 
 from lm_eval import evaluator, tasks, utils, models
@@ -172,6 +173,12 @@ def benchmark(model, config):
     return output_results
 
 def run_evaluation_loop(model, eval_loader, accelerator, num_steps: int, loss_types: List[str] = [], materialize_logits: bool = True):
+    # Set model to eval mode
+    model.eval()
+    
+    # Wait for all processes to reach this point
+    accelerator.wait_for_everyone()
+    
     with torch.no_grad():
         all_gathered_losses = defaultdict(list)
         all_gathered_tokens = defaultdict(list)
@@ -214,6 +221,14 @@ def run_evaluation_loop(model, eval_loader, accelerator, num_steps: int, loss_ty
                     
             del main_loss, tracked_losses, num_items_for_main_loss, tracked_tokens_per_loss_type
 
+            # Add periodic synchronization (particularly important)
+            if i % 5 == 0:  # Every 5 steps
+                accelerator.wait_for_everyone()
+                
+            # Clear CUDA cache periodically
+            if i % 10 == 0:
+                torch.cuda.empty_cache()
+                
         losses_dict = {}
         for loss_type in all_gathered_losses.keys():
             losses = all_gathered_losses[loss_type]
@@ -231,6 +246,13 @@ def run_evaluation_loop(model, eval_loader, accelerator, num_steps: int, loss_ty
             losses_dict[f"{loss_type}_weighted_loss"] = weighted_avg_loss
             losses_dict[f"{loss_type}_loss"] = avg_loss
 
+    # Final synchronization and cleanup
+    accelerator.wait_for_everyone()
+    torch.cuda.empty_cache()
+    
+    # Set model back to training mode
+    model.train()
+    
     return losses_dict
 
 
@@ -251,6 +273,7 @@ def evaluate(model, eval_loader, accelerator, num_steps=100, eval_config: Dict =
     eval_loop_results = run_evaluation_loop(model, eval_loader, accelerator, num_steps, eval_config.get("losses_to_track", []), eval_config.get("materialize_logits", True))
 
     results.update(eval_loop_results)
+    model.train()
     return results
 
 
@@ -263,14 +286,14 @@ def main(args):
     state = PartialState()
     num_processes = state.num_processes
 
-    save_model_type = args.save_model
+    save_checkpoints_type = args.save_checkpoints
     logging_mode = args.logging_mode
     if args.dry_run:
         logging_mode = logging.DEBUG
         if args.wandb and args.wandb_tags:
             args.wandb_tags = ["dryrun"]
         if args.checkpointing_steps > 1:  #sometimes we are checking checkpoints every step and we dont want dry run to prevent that
-            save_model_type = None
+            save_checkpoints_type = None
 
     logger = setup_logging(logging_mode)
 
@@ -420,14 +443,14 @@ def main(args):
             tags = args.wandb_tags if len(args.wandb_tags) > 0 else None
             logger.info(f"Logging to wandb with tags: {tags}")
             wandb.login()
-            with wandb.init(project=args.wandb,
+            run = wandb.init(project=args.wandb,
                             tags=tags,
                             name=f"Training Run {output_dir.split('/')[-1]}", 
                             config=vars(args)
-                            ) as run:
-                run.config.update({"output_dir" : output_dir}, allow_val_change=True)
-                params_dict = {f"{k}_wandb": v for k, v in params_dict.items() if k != "output_dir"}
-                run.config.update(params_dict)  # add ablation params to wandb
+                            )
+            run.config.update({"output_dir" : output_dir}, allow_val_change=True)
+            params_dict = {f"{k}_wandb": v for k, v in params_dict.items() if k != "output_dir"}
+            run.config.update(params_dict)  # add ablation params to wandb
             # TODO Resume?
 
 
@@ -445,13 +468,13 @@ def main(args):
         pass
 
     ###### EXTEND MODEL EMBEDDINGS ######
-    if args.embedding_init_strategy is not None and num_new_tokens > 0:
+    if embedding_init_strategy is not None and num_new_tokens > 0:
         # Extend model embeddings
-        logger.info(f"Extending model embeddings with strategy: {args.embedding_init_strategy} and adding {num_new_tokens} new tokens")
+        logger.info(f"Extending model embeddings with strategy: {embedding_init_strategy} and adding {num_new_tokens} new tokens")
         model = extend_model_embeddings(
             model, 
             num_new_tokens, 
-            init_strategy=args.embedding_init_strategy,
+            init_strategy=embedding_init_strategy,
             tokenizer=tokenizer
         )
         if "new_tokens" not in eval_other_loss_types:
@@ -469,7 +492,6 @@ def main(args):
         raise ValueError(f"Embedding size {embedding_size_in}/{embedding_size_out} (input/output) does not match vocab size {new_vocab_size}")
 
     ###### FINETUNING MODES (FREEZING PARAMS) ######
-    logger.info(f"Finetuning mode: {finetuning_params}")
     model_is_frozen = False
     if finetuning_params == "new_tokens_only":
         model = freeze_old_embeddings(model, num_new_tokens)
@@ -555,12 +577,21 @@ def main(args):
     eval_batches = len(eval_loader)
     eval_loader_token_count = sum(ds["test"]["num_tokens"])
 
-    def get_next_batch(training_iterator, train_loader, epoch):
+    def get_next_batch(training_iterator, train_loader, epoch, epoch_step, skip_iterator=None):
+        if skip_iterator is not None:
+            try:
+                batch = next(skip_iterator)
+                batch = {k: v.cpu() for k, v in batch.items()}
+                return batch, train_loader, epoch, epoch_step, skip_iterator
+            except StopIteration:
+                logger.info("finished skip iter")
+                epoch += 1
+                epoch_step = 0
         try:
             batch = next(training_iterator)
             # Immediately move to CPU if not needed
             batch = {k: v.cpu() for k, v in batch.items()}
-            return batch, training_iterator, epoch
+            return batch, training_iterator, epoch, epoch_step, None
         except StopIteration:
             # End of epoch reached, create new iterator
             epoch += 1
@@ -568,7 +599,8 @@ def main(args):
             training_iterator = iter(train_loader)
             batch = next(training_iterator)
             batch = {k: v.cpu() for k, v in batch.items()}
-            return batch, training_iterator, epoch
+            epoch_step = 0
+            return batch, training_iterator, epoch, epoch_step, None
         
     logger.info("Loaded data into dataset")
 
@@ -672,6 +704,7 @@ def main(args):
     logger.debug(f"Accelerator state: {accelerator.state}")
 
     ###### LOAD CHECKPOINT METADATA ######
+    skip_iterator = None
     if loaded_checkpoint:
         # load training state
         try:
@@ -683,7 +716,14 @@ def main(args):
             cumulative_batch_counter = state_dict["cumulative_batch_counter"]
             cumulative_token_counter = state_dict["cumulative_token_counter"]
             cumulative_new_token_counter = state_dict["cumulative_new_token_counter"]
-            train_loader = accelerator.skip_first_batches(train_loader, (epoch_step+1)*gradient_accumulation_steps)  #skip step in epoch
+            batch_skips = int((epoch_step+1)*gradient_accumulation_steps)
+            if batch_skips >= len(train_loader):
+                logger.warning(f"Epoch step {batch_skips} is greater than the number of batches in the train loader {len(train_loader)}")
+                epoch_step = -1
+            else:
+                logger.info(f"Skipping {batch_skips} batches (per loader)")
+                skip_loader = accelerator.skip_first_batches(train_loader, batch_skips)  # skip step in epoch
+                skip_iterator = iter(skip_loader)
             update_step = resume_step
             logger.info(f"Resuming training after step {resume_step}")
         except Exception as e:
@@ -691,26 +731,6 @@ def main(args):
             logger.info(f"Error: {e}")
 
     training_iterator = iter(train_loader)
-
-    logger.info(f"Training setup:")
-    logger.info(f"max train steps {max_train_steps}") # ({math.ceil(max_train_steps / num_processes)} per device)")
-    logger.info(f"total gradient updates {total_gradient_updates}") # ({total_gradient_updates_per_device} per device)")
-    logger.info(f"grad updates per epoch {grad_updates_per_device_per_epoch * num_processes}") # ({grad_updates_per_device_per_epoch} per device)")
-    logger.info(f"train samples: {train_samples}, batches: {train_batches}, and tokens: {train_loader_token_count}")
-    logger.info(f"train samples per device: {len(train_loader) * batch_size}, batches per device: {len(train_loader)}, and tokens (approx): {train_loader_token_count / num_processes}")
-    logger.info(f"eval samples: {eval_samples}, batches: {eval_batches}, and tokens: {eval_loader_token_count}")
-    logger.info(f"eval samples per device: {len(eval_loader) * args.eval_batch_size}, batches per device: {len(eval_loader)}, and tokens (approx): {eval_loader_token_count / num_processes}")
-    logger.info(f"gradient steps {gradient_accumulation_steps}")
-    logger.info(f"per device batch size {args.batch_size}, eval batch size {args.eval_batch_size}")
-    logger.info(f"accelerator distributed type {accelerator.distributed_type}, num_processes {num_processes} on {torch.cuda.get_device_name()}")
-    logger.info(f"effective batch size {total_batch_size}")
-    logger.info(f"learning rate {args.learning_rate}, warmup steps {args.warmup_steps}, schedule_max_steps {max_train_steps}, split_scheduler {split_scheduler}")
-    logger.info(f"checkpointing steps {args.checkpointing_steps}")
-    logger.info(f"Training until {max_train_steps} steps")
-
-    can_train = True
-    if args.save_only:
-        can_train = False
 
     logger.info(f"Setup Eval config...")
     materialize_logits = not args.do_not_materialize_logits
@@ -741,6 +761,32 @@ def main(args):
         eval_config["tokenizer_path"] = vocab_file_path
     if pre_tok_name is not None:
         eval_config["pre_tok_name"] = pre_tok_name
+
+    logger.info(f"--------------------------------")
+    logger.info(f"Training setup:")
+    logger.info(f"max train steps {max_train_steps}") # ({math.ceil(max_train_steps / num_processes)} per device)")
+    logger.info(f"total gradient updates {total_gradient_updates} (per epoch {grad_updates_per_device_per_epoch * num_processes})") # ({total_gradient_updates_per_device} per device)")
+    logger.info(f"gradient steps {gradient_accumulation_steps}")
+    logger.info(f"per device batch size {batch_size}, eval batch size {args.eval_batch_size}")
+    logger.info(f"num gpus: {num_processes}")
+    logger.info(f"effective batch size {total_batch_size}")
+    logger.info(f"learning rate {args.learning_rate}, warmup steps {args.warmup_steps}, schedule_max_steps {max_train_steps}, split_scheduler {split_scheduler}")
+    logger.info(f"checkpointing steps {args.checkpointing_steps}")
+    logger.info(f"Training until {max_train_steps} steps")
+
+    logger.info(f"train samples: {train_samples}, batches: {train_batches}, and tokens: {train_loader_token_count}")
+    logger.info(f"train samples per device: {len(train_loader) * batch_size}, batches per device: {len(train_loader)}, and tokens (approx): {train_loader_token_count / num_processes}")
+    logger.info(f"eval samples: {eval_samples}, batches: {eval_batches}, and tokens: {eval_loader_token_count}")
+    logger.info(f"eval samples per device: {len(eval_loader) * args.eval_batch_size}, batches per device: {len(eval_loader)}, and tokens (approx): {eval_loader_token_count / num_processes}")
+    logger.info(f"Task: {task_name}, extending params: {embedding_init_strategy}")
+    
+    logger.info(f"accelerator distributed type {accelerator.distributed_type}, num_processes {num_processes} on {torch.cuda.get_device_name()}")
+    logger.info(f"CPUs: {args.num_proc}, GPUs: {torch.cuda.device_count()} on {socket.gethostname()}.")
+    logger.info(f"--------------------------------")
+
+    can_train = True
+    if args.save_only:
+        can_train = False
 
     ###### TRAINING LOOP ######
     logger.info(f"Starting training loop...")
@@ -789,17 +835,19 @@ def main(args):
         accumulated_tokens_per_loss_type = defaultdict(list)
         
         for i in range(num_batches_in_step):
-            batch, training_iterator, epoch = get_next_batch(training_iterator, train_loader, epoch)
+            batch, training_iterator, epoch, epoch_step, skip_iterator = get_next_batch(training_iterator, train_loader, epoch, epoch_step, skip_iterator)
             total_batched_samples += 1
 
             # Move batch to device just before use
             batch = {k: v.to(accelerator.device) for k, v in batch.items()}
             mem_before_forward = torch.cuda.memory_allocated() / 1024**2
             largest_batch_per_device = max(largest_batch_per_device, batch['input_ids'].numel())
+            num_items_in_batch = (batch["labels"].ne(-100)).sum(1).cpu().tolist()
+
 
             logger.debug(f"Memory before forward pass opt_step: {update_step} accum_step:{i} - Device {accelerator.process_index}: {mem_before_forward:.2f} MB, "
                          f"largest_batch_per_device {largest_batch_per_device} "
-                         f"ids: {batch['input_ids'].numel()}", main_process_only=False
+                         f"ids: {batch['input_ids'].numel()}, tokens with losses: {num_items_in_batch}", main_process_only=False
                          )
 
             # IMPORTANT:
@@ -953,7 +1001,7 @@ def main(args):
                 gc.collect()
 
             # checkpointing (outsize main process)
-            if save_model_type == "all" and isinstance(args.checkpointing_steps, int) and update_step > 0:
+            if save_checkpoints_type is not None and isinstance(args.checkpointing_steps, int) and update_step > 0:
                 if update_step % args.checkpointing_steps == 0:
                     logger.info(f"Checkpointing at update step {update_step}")
                     
@@ -966,17 +1014,9 @@ def main(args):
                         "cumulative_batch_counter": cumulative_batch_counter,
                         "cumulative_token_counter": cumulative_token_counter,
                         "cumulative_new_token_counter": cumulative_new_token_counter,
+                        "current_batch_size": batch_size, # used to skip first batches
                     }
-                    save_checkpoint(accelerator, output_dir, state_dict, logger)
-                    
-                    # TODO this method of saving is to output a HF model
-                    # unwrapped_model = accelerator.unwrap_model(model)
-                    # unwrapped_model.save_pretrained(
-                    #     output_dir_path,
-                    #     is_main_process=accelerator.is_main_process,
-                    #     save_function=accelerator.save,
-                    #     # state_dict=state_dict,
-                    # )
+                    save_checkpoint(accelerator, output_dir, state_dict, logger, delete_old_checkpoints=not save_checkpoints_type == "all")  # delete old checkpoints if not saving all
     
             if update_step % args.eval_steps == 0:
                 logger.debug(f"EVAL:Step {update_step}: Starting evaluation")
@@ -1007,7 +1047,7 @@ def main(args):
     # Make sure all processes are synced
     accelerator.wait_for_everyone()    
 
-    if save_model_type is not None:
+    if save_checkpoints_type is not None:
         logger.info(f"Preparing to save model to {output_dir}")
         
         if not check_disk_space(output_dir, required_space_gb=20):
@@ -1016,18 +1056,23 @@ def main(args):
 
         output_dir_ext = f"final_model"
         output_dir_path = os.path.join(output_dir, output_dir_ext)
-        # accelerator.save_state(output_dir_path)  # no need to save state on final model
-        state_dict = {
-            "update_step": update_step,
-            "epoch": epoch,
-            "epoch_step": epoch_step,
-            "update_step": update_step,
-            "total_batched_samples": total_batched_samples,
-            "cumulative_batch_counter": cumulative_batch_counter,
-            "cumulative_token_counter": cumulative_token_counter,
-            "cumulative_new_token_counter": cumulative_new_token_counter,
-        }
-        save_checkpoint(accelerator, output_dir, state_dict, logger)
+
+        if save_checkpoints_type == "model_only":
+            if accelerator.is_main_process:
+                remove_old_checkpoints(output_dir, logger)
+        else:
+            state_dict = {
+                "update_step": update_step,
+                "epoch": epoch,
+                "epoch_step": epoch_step,
+                "update_step": update_step,
+                "total_batched_samples": total_batched_samples,
+                "cumulative_batch_counter": cumulative_batch_counter,
+                "cumulative_token_counter": cumulative_token_counter,
+                "cumulative_new_token_counter": cumulative_new_token_counter,
+                "current_batch_size": batch_size,  # used to skip first batches
+            }
+            save_checkpoint(accelerator, output_dir, state_dict, logger, delete_old_checkpoints=not save_checkpoints_type == "all")
 
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.save_pretrained(
@@ -1088,11 +1133,8 @@ def main(args):
     accelerator.wait_for_everyone()
     accelerator.end_training()
 
-if __name__ == "__main__":
-    try:
-        threads = min(psutil.cpu_count(logical=False), len(psutil.Process().cpu_affinity()))
-    except:
-        threads = os.cpu_count()
+def parse_args():
+    threads = get_cpus()
 
     args = argparse.ArgumentParser()
 
@@ -1110,9 +1152,9 @@ if __name__ == "__main__":
     args.add_argument("--num-proc", type=int, default=threads)
     args.add_argument("--save-only", action="store_true")
     args.add_argument("--save-dataset-path", type=str)
-    args.add_argument("--save-model", type=str,
-                    choices=["final", "all", None],
-                    default="all",
+    args.add_argument("--save-checkpoints", type=str,
+                    choices=["final", "all", None, "model_only"],
+                    default="model_only",
                     help="Whether to save the model after training")
 
     # finetuning params
@@ -1230,7 +1272,9 @@ if __name__ == "__main__":
         else:
             raise ValueError(f"Invalid task name: {args.task_name}")
 
-    main(args)
+if __name__ == "__main__":
+    
+    main(parse_args())
 
     # TODO consider training params:
     # - lora

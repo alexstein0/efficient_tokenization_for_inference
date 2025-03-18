@@ -28,6 +28,6 @@ python train_tokenizer.py \
     --pre-tok-name empty \
     --cont-or-start start \
     --batch-size 1000 \
-    --added-tokens 1000 \
+    --added-tokens 10 \
     --tokenizer-path-old meta-llama/Llama-3.2-1B \
     --tokenizer-source huggingface

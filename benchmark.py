@@ -25,6 +25,9 @@ def compile_eval_scripts(base_dir, output_bash_file):
                     if os.path.isdir(final_model_path):
                         missing_list.append(subdir_path)
 
+                    else:
+                        print(f"No lm_eval.sh or final_model found in {subdir_path}, maybe still training?")
+
     print(f"Compiled lm_eval scripts from {len(eval_scripts)} directories into {output_bash_file}")
     return missing_list
 

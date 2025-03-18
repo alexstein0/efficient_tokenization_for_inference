@@ -6,6 +6,7 @@ from accelerate.logging import get_logger
 import torch
 import json
 import hashlib
+import psutil
 
 def setup_logging(log_level=logging.INFO):
     """Setup global logging configuration"""
@@ -97,10 +98,21 @@ def generate_hashed_dir_name(params_dict, output_folder="output", dry_run=False)
     params_json = json.dumps(params_dict, sort_keys=True).encode()
     params_hash = hashlib.md5(params_json).hexdigest()[:8]  # 8 chars short hash
 
-    output_dir = f"{params_hash}-{params_dict['model_name']}-{params_dict['task_name']}"
+    output_dir = f"{params_hash}-{params_dict['model_name']}-{params_dict['task_name']}-{params_dict['num_new_tokens']}"
     
     if dry_run:
         output_dir = f"dryrun-{output_dir}"
     
     return os.path.join(output_folder, output_dir)
+
+def get_cpus() -> int:
+    # Number of threads
+    try:
+        return min(psutil.cpu_count(logical=False), len(psutil.Process().cpu_affinity()))  # covering both affinity and phys.
+    except:
+        pass
+    try:
+        return os.cpu_count()  # when running on mac
+    except:
+        return 1
 

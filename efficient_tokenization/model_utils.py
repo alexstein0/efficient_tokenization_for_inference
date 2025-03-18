@@ -3,23 +3,27 @@ from typing import Dict, List, Tuple
 import os
 import shutil
 
-def save_checkpoint(accelerator, output_dir, state_dict, logger):
+def save_checkpoint(accelerator, output_dir, state_dict, logger, delete_old_checkpoints: bool = True):
     # Delete previous checkpoints before saving new one
-    checkpoint_dir = os.path.join(output_dir, "checkpoints")
-    if accelerator.is_main_process and os.path.exists(checkpoint_dir):
-        checkpoint_prefix = "checkpoint"
-        checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith(checkpoint_prefix)]
-        for checkpoint in checkpoints:
+    # output_dir = f"dryrun-{output_dir}"
+    if accelerator.is_main_process and delete_old_checkpoints:
+        remove_old_checkpoints(output_dir, logger)
+    accelerator.wait_for_everyone()
+    save_location = accelerator.save_state()  # accelerator handles state name
+
+    torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.pt"))
+
+def remove_old_checkpoints(output_dir, logger, checkpoint_ext: str = "checkpoints"):
+    # assumes main process
+    checkpoint_dir = os.path.join(output_dir, checkpoint_ext)
+    if os.path.exists(checkpoint_dir):
+        for checkpoint in os.listdir(checkpoint_dir):
             checkpoint_path = os.path.join(checkpoint_dir, checkpoint)
             logger.debug(f"Removing old checkpoint: {checkpoint_path}", main_process_only=False)
             try:
                 shutil.rmtree(checkpoint_path)
             except Exception as e:
                 logger.warning(f"Error removing checkpoint {checkpoint_path}: {e}")
-    accelerator.wait_for_everyone()
-    save_location = accelerator.save_state()  # accelerator handles state name
-
-    torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.pt"))
 
 def calculate_grad_norm(parameters, norm_type=2.0, error_if_nonfinite=False, foreach=None, is_grad=False):
     if isinstance(parameters, torch.Tensor):
