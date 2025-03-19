@@ -1,26 +1,25 @@
-import argparse
 import torch
 import torch.nn as nn
 import os
-from datasets import load_dataset, load_from_disk, DatasetDict
+import sys
+from datasets import load_from_disk, DatasetDict
 from datetime import timedelta
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, set_seed, ProjectConfiguration, DataLoaderConfiguration
-from accelerate.state import AcceleratorState, PartialState
+from accelerate.state import PartialState
 from tqdm import tqdm
-from transformers import set_seed, DataCollatorWithPadding, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup, AutoModelForCausalLM, TrainingArguments, Trainer, TextStreamer, AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
+from transformers import set_seed, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup, AutoTokenizer
 import datasets
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
 import torch.distributed as dist
 import csv
 import shutil
 import math
-from typing import Any, Dict, List, Union
+from typing import Dict, List
 from collections import defaultdict
 
 import socket
-from accelerate.logging import get_logger
 import logging
 import json
 import glob
@@ -29,8 +28,8 @@ import psutil
 from efficient_tokenization.tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer
 from efficient_tokenization.extend_embeddings import extend_model_embeddings, initialize_new_embeddings, get_new_embedding_params, get_new_embeddings_grads, unfreeze_model, freeze_model_except_embeddings, freeze_old_embeddings
 from efficient_tokenization.data_utils import MyPaddingCollator, MyPaddingCollatorWithLossMask, create_memory_efficient_loader
-from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name, get_cpus
-from efficient_tokenization.model_utils import forward_pass, move_optimizer_to_cpu, move_optimizer_to_gpu, calculate_grad_norm, save_checkpoint, remove_old_checkpoints
+from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name, get_cpus, parse_args
+from efficient_tokenization.model_utils import forward_pass, move_optimizer_to_cpu, move_optimizer_to_gpu, calculate_grad_norm, save_checkpoint, remove_old_checkpoints, calc_batch_size_stuff
 from efficient_tokenization.benchmarking_utils import get_lm_eval_string
 
 from lm_eval import evaluator, tasks, utils, models
@@ -296,6 +295,8 @@ def main(args):
             save_checkpoints_type = None
 
     logger = setup_logging(logging_mode)
+    logger.info("Running with following command:")
+    logger.info("".join(sys.argv))
 
     ###### INIT MODEL ######
     logger.info(f"Loading model from {args.model}...")
@@ -344,29 +345,17 @@ def main(args):
     model.config.original_vocab_size = original_vocab_size
     logger.info(f"Tokenizer vocab size: {len(tokenizer)}, model vocab size: {original_vocab_size}")
     num_new_tokens = len(tokenizer) - model.config.vocab_size
+    
+    if args.num_new_tokens > 0:
+        assert args.num_new_tokens == num_new_tokens, "tokenizer adding different number than num_new tokens"
     args.num_new_tokens = num_new_tokens
 
     ###### BATCH SIZE STUFF ######
     logger.info(f"Setting batch size and gradient accumulation steps...")
-    if args.total_batch_size is not None:
-        total_batch_size = args.total_batch_size
-        if args.batch_size is not None:
-            batch_size = args.batch_size
-            gradient_accumulation_steps = total_batch_size // (batch_size * num_processes)
-        elif args.gradient_accumulate_every is not None:
-            gradient_accumulation_steps = args.gradient_accumulate_every
-            batch_size = total_batch_size // (gradient_accumulation_steps * num_processes)
-        else:
-            raise ValueError("Either batch_size or gradient_accumulate_every must be provided if inferring from total_batch_size")
-    else:
-        gradient_accumulation_steps = args.gradient_accumulate_every
-        batch_size = args.batch_size
-        total_batch_size = args.batch_size * args.gradient_accumulate_every * num_processes
-
-    # make sure the rounding is correct
-    total_batch_size = (
-        batch_size * num_processes * gradient_accumulation_steps
-    )
+    total_batch_size, batch_size, gradient_accumulation_steps = calc_batch_size_stuff(total_batch_size = args.total_batch_size, 
+                                                                                      batch_size = args.batch_size, 
+                                                                                      num_processes = num_processes, 
+                                                                                      gradient_accumulate_every = args.gradient_accumulate_every)
     num_epochs = args.num_epochs
 
     args.batch_size = batch_size
@@ -385,6 +374,7 @@ def main(args):
     task_name = args.task_name # 6. task_name
     main_loss_type = args.main_loss # 7. main_loss
     # num_new_tokens = args.num_new_tokens # 8. num_new_tokens
+    unfreeze_params_steps = args.unfreeze_params_steps
 
     params_dict = {
         "model_name": model_name,
@@ -394,7 +384,8 @@ def main(args):
         "learning_rate": learning_rate,
         "main_loss_type": main_loss_type,
         "embedding_init_strategy": embedding_init_strategy,
-        "num_new_tokens": num_new_tokens
+        "num_new_tokens": num_new_tokens,
+        "unfreeze_params_steps": args.unfreeze_params_steps
     }
 
     if args.output_dir is not None:
@@ -403,10 +394,15 @@ def main(args):
         # uses hash of params to generate unique output dir
         output_dir = generate_hashed_dir_name(params_dict, dry_run=dry_run)
 
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, "train_config.json"), "w") as f:
-            json.dump(params_dict, f)
+    output_dir_ext = f"final_model"
+    final_model_location = os.path.join(output_dir, output_dir_ext)
+    if not args.overwrite_final and os.path.exists(final_model_location):
+        logger.critical(f"final model already exists at {final_model_location}, ensure that we want to rerun, and do so with --overwrite-final")
+        raise FileExistsError()
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "train_config.json"), "w") as f:
+        json.dump(params_dict, f)
 
     ###### INIT OPTIMIZER ######
     logger.info(f"Initializing optimizer...")
@@ -416,7 +412,7 @@ def main(args):
     ###### INITIALIZE ACCELERATOR ######
     logger.info(f"Initializing accelerator...")
     timeout = InitProcessGroupKwargs(timeout=timedelta(seconds=1_000_000))
-    project_config = ProjectConfiguration(project_dir=output_dir, 
+    project_config = ProjectConfiguration(project_dir=output_dir,
                                           automatic_checkpoint_naming=True
                                           )
     
@@ -812,7 +808,7 @@ def main(args):
 
         model.train()
         # TODO add time of each iteration, and memory usage
-        if model_is_frozen and args.unfreeze_params_steps > 0 and update_step >= args.unfreeze_params_steps:
+        if model_is_frozen and unfreeze_params_steps > 0 and update_step >= unfreeze_params_steps:
             logger.info(f"Unfreezing model parameters at step {update_step}")
             model = unfreeze_model(model)
             model_is_frozen = False
@@ -1054,7 +1050,6 @@ def main(args):
             logger.info("Aborting save due to insufficient disk space")
             return
 
-        output_dir_ext = f"final_model"
         output_dir_path = os.path.join(output_dir, output_dir_ext)
 
         if save_checkpoints_type == "model_only":
@@ -1132,145 +1127,6 @@ def main(args):
     # Make sure all processes are synced before ending
     accelerator.wait_for_everyone()
     accelerator.end_training()
-
-def parse_args():
-    threads = get_cpus()
-
-    args = argparse.ArgumentParser()
-
-    # implementation params
-    args.add_argument("--dry-run", action="store_true")
-    args.add_argument("--logging-mode", type=str, choices=["INFO", "DEBUG"], default="INFO")
-    args.add_argument("--cpu-batch-size", type=int, default=1000)
-    args.add_argument("--checkpointing-steps", type=int)
-    args.add_argument("--resume-from-checkpoint", type=str, default="latest",
-                     help="Path to checkpoint directory or 'latest' to let accelerate handle latest")
-    args.add_argument("--wandb", type=str)
-    args.add_argument("--wandb-tags", type=str)
-    args.add_argument("--seed", type=int, default=42)
-    args.add_argument("--output-dir", type=str, required=False, default=None)
-    args.add_argument("--num-proc", type=int, default=threads)
-    args.add_argument("--save-only", action="store_true")
-    args.add_argument("--save-dataset-path", type=str)
-    args.add_argument("--save-checkpoints", type=str,
-                    choices=["final", "all", None, "model_only"],
-                    default="model_only",
-                    help="Whether to save the model after training")
-
-    # finetuning params
-    args.add_argument("--dataset", type=str, default=None)
-    args.add_argument("--total-batch-size", type=int, default=None)
-    args.add_argument("--batch-size", type=int, default=1)
-    args.add_argument("--gradient-accumulate-every", type=int, default=8)
-    args.add_argument("--max-train-steps", type=int, default=-1)
-    args.add_argument("--num-epochs", type=int, default=-1)
-    args.add_argument("--grad-norm", type=float, default=1.0, help="Max norm for gradient clipping. Set to None to disable.")
-    args.add_argument("--lora", action="store_true")  # TODO
-    args.add_argument("--deepspeed", action="store_true")  # TODO
-    args.add_argument("--task-name", type=str,
-                      choices=["SFT", "translation", "mixed"],
-                      default="SFT",
-                      help="Whether to finetune the model parameters")
-    
-    # positional embeddings
-    args.add_argument("--scaling-factor", type=float, default=16.0) # TODO
-    args.add_argument("--scaling-type", type=str, default="yarn") # TODO
-    args.add_argument("--rope-theta", type=float, default=10000.0) # TODO
-    args.add_argument("--original-max-position-embeddings", type=int)
-    args.add_argument("--max-position-embeddings", type=int)
-    # LR 
-    args.add_argument("--learning-rate", type=float, default=2e-5)
-    args.add_argument("--warmup-steps", type=int, default=10)
-    args.add_argument("--lr-schedule", type=str, choices=["linear", "constant"], default="linear")
-    
-    # Model params
-    args.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B")
-    # args.add_argument("--architecture", type=str,
-    #                   choices=["llama", "mistral", "gemma"], default="llama")
-    args.add_argument("--sliding-window-attention-schedule", type=str)  # TODO
-    args.add_argument("--tokenizer-path", type=str)
-    args.add_argument("--pre-tok-name", type=str, default="empty")
-    
-    # vocab extension params
-    args.add_argument("--embedding-init-strategy", type=str,
-                     choices=["default", "random", "clone", "mean", "zeros", "merge", None],
-                     default=None,
-                     help="Strategy for initializing new token embeddings")
-    args.add_argument("--finetune-params", type=str,
-                      choices=["full", "embeddings", "new_tokens_only"],
-                      default="full",
-                      help="Whether to finetune the model parameters")
-    args.add_argument("--unfreeze-params-steps", type=int,
-                    default=-1,
-                    help="Steps to switch to finetuning params")
-    args.add_argument("--main-loss", type=str,
-                      choices=["all", "translated", "new_tokens", None],
-                      default=None,
-                      help="Whether to backpropagate on all losses or just some")
-    args.add_argument("--train-losses-to-track", type=str,
-                      default=None,
-                      help="List of losses to track during training")
-    args.add_argument("--eval-losses-to-track", type=str,
-                      default=None,
-                      help="List of losses to track during evaluation")
-
-
-    # EVAL PARAMS
-    args.add_argument("--eval-steps", type=int, default=1000,
-                     help="Number of steps between evaluations")
-    args.add_argument("--eval-iters", type=int, default=100,
-                     help="Number of iterations to run for evaluation")
-    args.add_argument("--run-lm-eval", action="store_true",
-                     help="Run language model evaluation")
-    args.add_argument("--eval-batch-size", type=int, default=2,
-                     help="Batch size for evaluation")
-    args.add_argument("--num-fewshot", type=int, default=4,
-                     help="Number of fewshot examples")
-    args.add_argument("--limit", type=int, default=100,
-                     help="Number of samples to limit evaluation to")
-    args.add_argument("--log-samples", action="store_true",
-                     help="store actual samples from benchmark")
-    args.add_argument("--benchmark-tasks", type=str, default="minerva_math",
-                     help="Benchmark tasks to run")
-    args.add_argument("--do-not-materialize-logits", action="store_true",
-                     help="Whether to not materialize logits for additional time savings")
-    
-    args = args.parse_args()
-
-    # some config validation
-    args.wandb_tags = args.wandb_tags.split(",") if args.wandb_tags else None
-
-    # loss tracking
-
-    allowed_loss_types = ["all", "translated", "new_tokens"]
-    train_losses_to_track = args.train_losses_to_track.split(",") if args.train_losses_to_track else []
-    for loss_type in train_losses_to_track:
-        if loss_type not in allowed_loss_types:
-            raise ValueError(f"Invalid train loss type: {loss_type}")
-    args.train_losses_to_track = train_losses_to_track
-        
-    eval_losses_to_track = args.eval_losses_to_track.split(",") if args.eval_losses_to_track else ["all"]
-    for loss_type in eval_losses_to_track:
-        if loss_type not in allowed_loss_types:
-            raise ValueError(f"Invalid eval loss type: {loss_type}")
-        
-    if args.task_name == "translation":
-        if "translated" not in eval_losses_to_track:
-            eval_losses_to_track.append("translated")
-        # if "new_tokens" not in args.eval_losses_to_track:
-        #     eval_losses_to_track.append("new_tokens")
-    args.eval_losses_to_track = eval_losses_to_track
-
-    if args.main_loss == None:
-        args.main_loss = "all"
-        if args.task_name == "SFT":
-            args.main_loss = "all"
-        elif args.task_name == "translation":
-            args.main_loss = "translated"
-        elif args.task_name == "mixed":
-            raise NotImplementedError("Mixed task name not implemented")
-        else:
-            raise ValueError(f"Invalid task name: {args.task_name}")
 
 if __name__ == "__main__":
     

@@ -3,6 +3,29 @@ from typing import Dict, List, Tuple
 import os
 import shutil
 
+def calc_batch_size_stuff(total_batch_size: int = None, batch_size: int = None, num_processes: int = None, gradient_accumulate_every: int = None):
+    if total_batch_size is not None:
+        total_batch_size = total_batch_size
+        if batch_size is not None:
+            batch_size = batch_size
+            gradient_accumulation_steps = total_batch_size // (batch_size * num_processes)
+        elif gradient_accumulate_every is not None:
+            gradient_accumulation_steps = gradient_accumulate_every
+            batch_size = total_batch_size // (gradient_accumulation_steps * num_processes)
+        else:
+            raise ValueError("Either batch_size or gradient_accumulate_every must be provided if inferring from total_batch_size")
+    else:
+        gradient_accumulation_steps = gradient_accumulate_every
+        batch_size = batch_size
+        total_batch_size = batch_size * gradient_accumulate_every * num_processes
+
+    # make sure the rounding is correct
+    total_batch_size = (
+        batch_size * num_processes * gradient_accumulation_steps
+    )
+    return total_batch_size, batch_size, gradient_accumulate_every
+
+
 def save_checkpoint(accelerator, output_dir, state_dict, logger, delete_old_checkpoints: bool = True):
     # Delete previous checkpoints before saving new one
     # output_dir = f"dryrun-{output_dir}"
