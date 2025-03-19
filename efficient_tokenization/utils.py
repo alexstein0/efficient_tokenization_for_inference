@@ -1,12 +1,13 @@
 import os
 import shutil
 import logging
-# from accelerate.logging import get_logger
+from accelerate.logging import get_logger
 import torch
 import json
 import hashlib
 import psutil
 import argparse
+import glob
 
 def setup_logging(log_level=logging.INFO):
     """Setup global logging configuration"""
@@ -93,12 +94,14 @@ def log_memory_usage(step, phase, accelerator):
                    f"Reserved: {gpu_memory_reserved:.2f}MB")
 
 
-def generate_hashed_dir_name(params_dict, output_folder="output", dry_run=False):
+def generate_hashed_dir_name(params_dict, output_folder="output", dry_run=False, include_num_tokens = True):
     # Serialize the dictionary of parameters in a deterministic way
     params_json = json.dumps(params_dict, sort_keys=True).encode()
     params_hash = hashlib.md5(params_json).hexdigest()[:8]  # 8 chars short hash
 
-    output_dir = f"{params_hash}-{params_dict['model_name']}-{params_dict['task_name']}-{params_dict['num_new_tokens']}"
+    output_dir = f"{params_hash}-{params_dict['model_name']}-{params_dict['task_name']}"
+    if include_num_tokens:
+        output_dir = f"{output_dir}-{params_dict['num_new_tokens']}"
     
     if dry_run:
         output_dir = f"dryrun-{output_dir}"
@@ -116,6 +119,24 @@ def get_cpus() -> int:
     except:
         return 1
     
+def get_latest_checkpoint(output_dir: str) -> str | None:
+    """Find the latest checkpoint in the checkpoints directory."""
+    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    if not os.path.exists(checkpoint_dir):
+        logger.warning(f"No checkpoints directory found at {checkpoint_dir}")
+        return None
+    
+    checkpoint_paths = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*"))
+    if not checkpoint_paths:
+        logger.warning(f"No checkpoints found in {checkpoint_dir}")
+        return None
+    
+    # Sort by modification time (most recent first)
+    checkpoint_paths.sort(key=os.path.getmtime, reverse=True)
+    latest = checkpoint_paths[0]
+    logger.info(f"Found latest checkpoint: {latest}")
+    return latest
+
 
 def parse_args():
     threads = get_cpus()

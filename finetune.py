@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import os
 import sys
 from datasets import load_from_disk, DatasetDict
@@ -28,7 +27,7 @@ import psutil
 from efficient_tokenization.tokenize_simple import get_tokenized_data, flatten_genqa_conversations, my_tokenize, get_genqa_data, get_tokenizer
 from efficient_tokenization.extend_embeddings import extend_model_embeddings, initialize_new_embeddings, get_new_embedding_params, get_new_embeddings_grads, unfreeze_model, freeze_model_except_embeddings, freeze_old_embeddings
 from efficient_tokenization.data_utils import MyPaddingCollator, MyPaddingCollatorWithLossMask, create_memory_efficient_loader
-from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name, get_cpus, parse_args
+from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name, get_cpus, parse_args, get_latest_checkpoint
 from efficient_tokenization.model_utils import forward_pass, move_optimizer_to_cpu, move_optimizer_to_gpu, calculate_grad_norm, save_checkpoint, remove_old_checkpoints, calc_batch_size_stuff
 from efficient_tokenization.benchmarking_utils import get_lm_eval_string
 
@@ -63,23 +62,6 @@ def log_loss(metrics_dict, output_dir, filename="loss_log.csv"):
             writer.writerow(metrics_dict.keys())
         writer.writerow(metrics_dict.values())
 
-def get_latest_checkpoint(output_dir):
-    """Find the latest checkpoint in the checkpoints directory."""
-    checkpoint_dir = os.path.join(output_dir, "checkpoints")
-    if not os.path.exists(checkpoint_dir):
-        logger.warning(f"No checkpoints directory found at {checkpoint_dir}")
-        return None
-    
-    checkpoint_paths = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*"))
-    if not checkpoint_paths:
-        logger.warning(f"No checkpoints found in {checkpoint_dir}")
-        return None
-    
-    # Sort by modification time (most recent first)
-    checkpoint_paths.sort(key=os.path.getmtime, reverse=True)
-    latest = checkpoint_paths[0]
-    logger.info(f"Found latest checkpoint: {latest}")
-    return latest
 
 def benchmark(model, config):
     """
@@ -397,8 +379,7 @@ def main(args):
     output_dir_ext = f"final_model"
     final_model_location = os.path.join(output_dir, output_dir_ext)
     if not args.overwrite_final and os.path.exists(final_model_location):
-        logger.critical(f"final model already exists at {final_model_location}, ensure that we want to rerun, and do so with --overwrite-final")
-        raise FileExistsError()
+        raise FileExistsError(f"Final model already exists at {final_model_location}. Use --overwrite-final to proceed.")
 
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "train_config.json"), "w") as f:
@@ -1129,8 +1110,8 @@ def main(args):
     accelerator.end_training()
 
 if __name__ == "__main__":
-    
-    main(parse_args())
+    args = parse_args()
+    main(args)
 
     # TODO consider training params:
     # - lora
