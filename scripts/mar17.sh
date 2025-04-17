@@ -9,7 +9,7 @@
 
 # Baseline
 # accelerate launch --num_processes 8 finetune.py --total-batch-size 64 --max-train-steps 5000 --batch-size 1 --eval-steps 100 --learning-rate 4e-5 --checkpointing-steps 1000 --wandb efficient_tokenization  --dataset /cmlscratch/astein0/efficient_tokenization_for_inference/datasets/llama_tokenized --task-name SFT --finetune-params full --wandb-tags SFT,all_params_free,baseline,new_runs --num-new-tokens 10
-# accelerate launch --num_processes 4 finetune.py --total-batch-size 128 --max-train-steps 5000 --batch-size 1 --eval-steps 100 --learning-rate 8e-5 --checkpointing-steps 1000 --wandb efficient_tokenization  --dataset /cmlscratch/astein0/efficient_tokenization_for_inference/datasets/llama_tokenized --task-name SFT --finetune-params full --wandb-tags SFT,all_params_free,baseline,new_runs --num-new-tokens 10
+# accelerate launch --num_processes 8 finetune.py --total-batch-size 128 --max-train-steps 5000 --batch-size 1 --eval-steps 100 --learning-rate 8e-5 --checkpointing-steps 1000 --wandb efficient_tokenization  --dataset /cmlscratch/astein0/efficient_tokenization_for_inference/datasets/llama_tokenized --task-name SFT --finetune-params full --wandb-tags SFT,all_params_free,baseline,new_runs --num-new-tokens 10
 # accelerate launch --num_processes 8 finetune.py --total-batch-size 256 --max-train-steps 5000 --batch-size 1 --eval-steps 100 --learning-rate 1.6e-4 --checkpointing-steps 1000 --wandb efficient_tokenization  --dataset /cmlscratch/astein0/efficient_tokenization_for_inference/datasets/llama_tokenized --task-name SFT --finetune-params full --wandb-tags SFT,all_params_free,baseline,new_runs --num-new-tokens 10
 
 # Extend Mean

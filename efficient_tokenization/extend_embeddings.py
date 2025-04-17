@@ -49,6 +49,36 @@ def get_new_embeddings_grads(model, num_new_tokens: int):
     # Return as list of parameters
     return [grad_slice_input, grad_slice_output]
 
+def get_old_embeddings_grads(model, num_new_tokens: int):
+    """
+    Get the embeddings for the newly added tokens.
+    
+    Args:
+        model: The model with extended vocabulary
+        num_new_tokens: Number of new tokens that were added
+        
+    Returns:
+        list: List of parameters corresponding to new token embeddings
+    """
+    # Handle distributed models
+    if hasattr(model, 'module'):
+        model = model.module
+    
+    embeddings_output = model.get_output_embeddings()
+    embeddings_input = model.get_input_embeddings()
+    
+    # Create indices for the new tokens
+    vocab_size = model.config.vocab_size
+
+    with torch.no_grad():
+        grad_slice_output = embeddings_output.weight.grad[:vocab_size - num_new_tokens].clone().detach()
+        grad_slice_input = embeddings_input.weight.grad[:vocab_size - num_new_tokens].clone().detach()
+
+    # new_embeddings_grad_output = embeddings_output.weight.grad[vocab_size - num_new_tokens:]
+    # new_embeddings_grad_input = embeddings_input.weight.grad[vocab_size - num_new_tokens:]
+
+    # Return as list of parameters
+    return [grad_slice_input, grad_slice_output]
 
 def calculate_new_embeddings_grad_norm(model, num_new_tokens, norm_type=2.0):
     """Calculate the gradient norm of the new embeddings."""
@@ -73,6 +103,7 @@ def initialize_new_embeddings(
         base_embeddings: Original embedding weights
         num_new_tokens: Number of new tokens to add
         init_strategy: Strategy to use for initialization
+            - "default": HF setting
             - "random": Standard normal initialization
             - "clone": Clone random existing embeddings
             - "mean": Initialize to mean of base embeddings
@@ -389,24 +420,41 @@ def freeze_model_except_embeddings(model, freeze_output_embeddings=True):
     for param in model.parameters():
         param.requires_grad = False
     
+    model = unfreeze_embeddings(model, freeze_output_embeddings=freeze_output_embeddings)
+    
+    return model
+
+def unfreeze_embeddings(model, freeze_output_embeddings=True):
     # Unfreeze input embeddings
     if hasattr(model, 'get_input_embeddings'):
         model.get_input_embeddings().weight.requires_grad = True
     
     # Optionally unfreeze output embeddings if they're not tied
-    if not freeze_output_embeddings and hasattr(model, 'get_output_embeddings'):
+    if freeze_output_embeddings and hasattr(model, 'get_output_embeddings'):
         output_embeddings = model.get_output_embeddings()
         if output_embeddings is not None:
             output_embeddings.weight.requires_grad = True
-    
     return model
-
 
 def unfreeze_model(model):
     for param in model.parameters():
         param.requires_grad = True
     
     return model
+
+def unfreeze_first_last_layer(model, logger):
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        if len(model.model.layers) > 0:
+            for param in model.model.layers[0].parameters():
+                param.requires_grad = True
+            for param in model.model.layers[-1].parameters():
+                param.requires_grad = True
+        else:
+            logger.warning("No layers found in model.model.layers!")
+    else:
+        logger.warning("Model does not have the expected Llama 'model.layers' structure.")
+    return model
+
 
         
 # Example usage:

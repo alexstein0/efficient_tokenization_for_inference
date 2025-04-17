@@ -19,16 +19,18 @@ from typing import Dict, Any
 import json
 
 import datasets
+
 datasets.disable_caching()
 
 from datasets.utils.logging import disable_progress_bar
 disable_progress_bar()
 
-from tokenizers import pre_tokenizers, Regex
+# from tokenizers import pre_tokenizers, Regex
 
 import argparse
 
-from efficient_tokenization.tokenize_simple import get_tokenizer, load_pretokenizer, pretokenizer_to_config
+from efficient_tokenization.tokenize_simple import load_pretokenizer, get_genqa_data, get_magpie_data
+from efficient_tokenization.tokenization_utils import SaveModule, read_training_info, read_tokenizer_from_model
 
 logger = logging.getLogger(__name__)
 
@@ -144,169 +146,6 @@ def extract_conversations_batched(example: Dict[str, List[List[Dict[str, str]]]]
 #     )
 #     return tokenized_dataset
 
-
-# # Solution
-
-### Handle rendering of specific bytes into visable characters
-
-# copied from https://github.com/huggingface/transformers/pull/30334/files#diff-08a7e5c7b50f73fc176e9a35899810080f0bc5b9e54278866f2b48ce68ddca30R1491
-
-def bytes_to_unicode():
-    """
-    Returns list of utf-8 byte and a mapping to unicode strings. We specifically avoids mapping to whitespace/control
-    characters the bpe code barfs on.
-    The reversible bpe codes work on unicode strings. This means you need a large # of unicode characters in your vocab
-    if you want to avoid UNKs. When you're at something like a 10B token dataset you end up needing around 5K for
-    decent coverage. This is a significant percentage of your normal, say, 32K bpe vocab. To avoid that, we want lookup
-    tables between utf-8 bytes and unicode strings.
-    """
-    bs = (
-        list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
-    )
-    cs = bs[:]
-    n = 0
-    for b in range(2**8):
-        if b not in bs:
-            bs.append(b)
-            cs.append(2**8 + n)
-            n += 1
-    cs = [chr(n) for n in cs]
-    return dict(zip(bs, cs))
-
-byte_encoder = bytes_to_unicode()
-
-def token_bytes_to_string(b):
-    return "".join([byte_encoder[ord(char)] for char in b.decode("latin-1")])
-
-def unicode_to_bytes():
-    """
-    Returns a mapping from unicode strings back to their original utf-8 bytes.
-    This reverses the `bytes_to_unicode` mapping.
-    """
-    # byte_encoder = bytes_to_unicode()  # Original byte-to-unicode mapping
-    return {v: k for k, v in byte_encoder.items()}
-
-byte_decoder = unicode_to_bytes()
-
-def string_to_token_bytes(s):
-    """
-    Converts a string back into token bytes using the reverse mapping.
-
-    Args:
-        s (str): The input string to convert.
-
-    Returns:
-        bytes: The byte representation of the string.
-    """
-    return bytes([byte_decoder[char] for char in s])
-
-
-### Read and save tokenizer in .model files
-
-def read_tokenizer_from_model(path: str):
-    with open(path, 'rb') as f:
-        contents = f.read()
-        contents = {
-            token: rank
-            for token, rank in (line.split() for line in contents.splitlines() if line)
-        }
-        mergeable_ranks = {
-            # base64.b64decode(token): int(rank)
-            token_bytes_to_string(base64.b64decode(token)): int(rank)
-            for token, rank in contents.items()
-        }
-    return mergeable_ranks
-
-def save_tokenizer(ranks_to_save, save_dir: str, save_name: str = None):
-    os.makedirs(save_dir, exist_ok=True)
-    save_name = save_name if save_name is not None else "tokenizer"
-
-    # Save new_mergeable_ranks to a file in the same format as it was loaded
-    with open(f'{save_dir}/{save_name}.model', 'wb') as f:
-        for token, rank in ranks_to_save.items():
-            # Encode the token to base64
-            encoded_token = base64.b64encode(string_to_token_bytes(token)).decode('utf-8')
-            # print(f"rank: {rank}, token: {token}, type: {type(token)}, encoded: {encoded_token}, type: {type(encoded_token)}")
-            f.write(f"{encoded_token} {rank}\n".encode('utf-8'))
-
-
-def save_training_info(data_dict: Dict[str, Any], save_dir: str, save_name: str = "training_info"):
-    os.makedirs(save_dir, exist_ok=True)
-    # Save data_dict to a file in the same format as it was loaded
-    with open(f'{save_dir}/{save_name}.json', 'w') as f:
-        json.dump(data_dict, f, indent = 4)
-
-
-def read_training_info(path: str) -> dict:
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_tokenizer_to_huggingface(original_tokenizer: PreTrainedTokenizerFast, new_tokenizer_path: str, new_tokenizer_json: dict):
-    # 2️⃣ Define new save path
-    os.makedirs(new_tokenizer_path, exist_ok=True)
-
-    # 3️⃣ Save the tokenizer to a directory
-    original_tokenizer.save_pretrained(new_tokenizer_path)
-
-    tokenizer_json_path = os.path.join(new_tokenizer_path, "tokenizer.json")
-    with open(tokenizer_json_path, "w") as f:
-        json.dump(new_tokenizer_json, f, indent=2)
-
-
-def convert_tokenizer_to_huggingface_correct(new_tokenizer_info: Dict[str, Any], original_tokenizer: PreTrainedTokenizerFast, pretok_override = None):
-    # must get original tokenizer from huggingface
-    tokenizer_json = json.loads(original_tokenizer._tokenizer.to_str())
-    
-    # old_vocab = tokenizer_json["model"]["vocab"]
-    # starting_index = len(tokenizer.get_vocab())
-    old_merges = tokenizer_json["model"]["merges"]
-
-    # Extract vocab (token: index)
-    old_vocab = original_tokenizer.get_vocab()
-    
-    # load new_tokenizer_info_path
-    # new_tokenizer_info = read_training_info(new_tokenizer_info_path)
-    # get merges and new_tokens
-    new_merges = new_tokenizer_info["merges"]
-    new_tokens = new_tokenizer_info["new_tokens"]
-
-    # Update vocab (append at the next available ID)
-    new_vocab = {**old_vocab}  # Copy the old vocab
-    starting_index = max(old_vocab.values()) + 1
-
-    for i, token in enumerate(new_tokens):
-        new_vocab[token] = starting_index + i
-
-    new_vocab_sorted = dict(sorted(new_vocab.items(), key=lambda item: item[1]))
-    # new_vocab_sorted = new_vocab
-
-    joined_merges = [x for x in old_merges]
-    joined_merges.extend(new_merges)
-
-    added_tokens = original_tokenizer.get_added_vocab()
-    add_tok_ids = [tok_id for _, tok_id in added_tokens.items()]
-
-    new_vocab_sorted_no_added = {tok: tok_id for tok, tok_id in new_vocab_sorted.items() if tok_id not in add_tok_ids}
-
-    new_tokenizer_json = {**tokenizer_json}
-    new_tokenizer_json["model"]["vocab"] = new_vocab_sorted_no_added
-    new_tokenizer_json["model"]["merges"] = joined_merges
-    if pretok_override is not None:
-        pre_tok_config = pretokenizer_to_config(pretok_override)
-        new_tokenizer_json["pre_tokenizer"] = pre_tok_config
-
-    # add new tokens to tokenizer
-    return new_tokenizer_json
-
-def save_tokenizer_new(info_dict: Dict[str, Any], save_dir: str, prior_tokenizer: str | PreTrainedTokenizerFast, pretok_override = None):
-    os.makedirs(save_dir, exist_ok=True)
-    if isinstance(prior_tokenizer, str):
-        prior_tokenizer = AutoTokenizer.from_pretrained(prior_tokenizer)
-    new_tokenizer_info = convert_tokenizer_to_huggingface_correct(info_dict, prior_tokenizer, pretok_override)
-    save_tokenizer_to_huggingface(prior_tokenizer, save_dir, new_tokenizer_info)
 
 
 def bpe_encode(
@@ -651,7 +490,7 @@ def single_loop(dataset: List[List[bytes]], ranks: Dict[bytes, int], original_si
         f"Occurrences: {occurrences:10d}  "                                             # Left-align occurrences with padding
         f"Dataset size: {new_token_count:10d} tokens  "
         f"Compression Rate: {compression_rate:4.3f} compression  "
-        f"Loop time: {seq_time3}"
+        f"Loop time: {seq_time3:5.3f}"
     )
     return dataset, ranks, most_common_pair, current_token_count
 
@@ -757,53 +596,6 @@ def compare_tokenizations(ds_raw: Dataset, tokenizer_path_old: str, tokenizer_fi
         j += 1
     print(comp)
 
-class SaveModule:
-    def __init__(self, save_loc: str, original_tokenizer: PreTrainedTokenizerFast | str, original_ds_size: int, pretokenizer, static_info: Dict[str, Any] = {}):
-        self.save_loc = save_loc
-        os.makedirs(self.save_loc, exist_ok=True)
-        if isinstance(original_tokenizer, str):
-            self.original_tokenizer = AutoTokenizer.from_pretrained(original_tokenizer)
-        else:
-            self.original_tokenizer = original_tokenizer
-
-        self.initial_vocab_size = len(self.original_tokenizer.get_vocab())
-        self.original_ds_size = original_ds_size
-        
-        self.static_info = {**static_info,
-            "save_path": self.save_loc,
-            "original_dataset_size": self.original_ds_size,
-            "initial_vocab_size": self.initial_vocab_size,
-        }
-        self.pretokenizer = pretokenizer
-
-    def save(self, ranks: Dict[bytes, int], merges: List[Tuple[bytes, bytes]], dataset_sizes: List[int], additional_info: Dict[str, Any] = {}):
-        new_added_tokens = get_new_added_tokens(ranks, merges)
-        num_added_tokens = len(ranks) - self.initial_vocab_size
-        compression_rate = 1 - (dataset_sizes[-1]/self.original_ds_size)
-        new_training_info = {
-            # "state": step,
-            "merges": merges,
-            "new_tokens": new_added_tokens,
-            "number_new_tokens": num_added_tokens,
-            "sizes": dataset_sizes,
-            # "duration": "0",
-            # "cont_or_start": args.cont_or_start,
-            # "save_tokenized_data": args.save_tokenized_data,
-            # "old_tokenzer_info": old_tokenizer_info
-            "compression_rate": compression_rate
-        }
-        training_info = {**self.static_info, **additional_info, **new_training_info}
-
-        if self.original_tokenizer is not None:
-            # will never be none, better check wll be f we allow the .model files to be used
-            save_tokenizer_new(training_info, self.save_loc, self.original_tokenizer, pretok_override=self.pretokenizer)
-        else:
-            save_tokenizer(training_info, self.save_loc)
-
-        save_training_info(training_info, self.save_loc)
-
-
-
 # Adapted from tiktokenizer code above
 def bpe_continue_train(
     data: Dataset, 
@@ -816,7 +608,7 @@ def bpe_continue_train(
     old_data: Dict = {},
     batch_size: int = 1000,
     threads: int = 16,
-    save_interval: int = 25,
+    save_interval: List[int] =[],
     cache_file_name: Optional[str] = None,
     # save_loc: str = "",
     # save_file_name: str = "",
@@ -880,11 +672,13 @@ def bpe_continue_train(
 
         new_merges.append(most_common_pair)
         dataset_sizes.append(current_dataset_size)
-        if (step % save_interval) == 0 and save_module is not None:
+        # if (step % save_interval) == 0 and save_module is not None:
+        if step in save_interval and save_module is not None:
             additional_info = {
                 "state": step,
             }
-            save_module.save(initial_ranks, new_merges, dataset_sizes, additional_info)
+            print(f"Saving at step {step}")
+            save_module.save(merges=new_merges, dataset_sizes=dataset_sizes, additional_info=additional_info, ranks=initial_ranks)
             # save_path = f"{save_loc}/{save_file_name}"
             # new_added_tokens = get_new_added_tokens(initial_ranks, new_merges)
             # added_tokens = vocab_size - len(initial_ranks)
@@ -946,7 +740,12 @@ def first_batch_generator(ds: Dataset, batch_size: int) -> Generator[List[str], 
     yield next(main_iterator)  # Call next on the iterator
 
 
-def get_data(cont_or_start: str, force_retokenize: bool, save_tokenized_data: bool, tokenized_data_name: str, ext: str, tokenizer_path_old: str, tokenizer_file_old: str, raw_data_name: str, pre_tok, threads: int, batch_size: int):
+def get_data(cont_or_start: str, force_retokenize: bool, save_tokenized_data: bool, 
+             dataset_path: str, tokenized_data_name: str, ext: str, 
+            #  tokenizer_path_old: str, tokenizer_file_old: str, 
+             tokenizer, base_tokenizer_path,
+             raw_data_name: str, pre_tok, 
+             threads: int, batch_size: int):
     logger.info("GETTING DATA")
     try:
         if cont_or_start == "cont":
@@ -956,24 +755,33 @@ def get_data(cont_or_start: str, force_retokenize: bool, save_tokenized_data: bo
         if force_retokenize:
             logger.info("Forcing retokenization of data")
             raise Exception("Forcing retokenization of data")
-        ds = load_from_disk(f"/fs/cml-projects/llm-pretraining/datasets/processed/{tokenized_data_name}/{ext}") #.select_columns('text')
+        # ds = load_from_disk(f"/fs/cml-projects/llm-pretraining/datasets/processed/{tokenized_data_name}/{ext}") #.select_columns('text')
+        ds = load_from_disk(os.path.join(dataset_path, tokenized_data_name)) #.select_columns('text')
         logger.info("Dataset loaded")
     except:
         logger.info("Downloading and processing raw dataset")
-        tok = PreTrainedTokenizerFast(vocab_file=f"{tokenizer_path_old}/{tokenizer_file_old}")
+        tok = tokenizer
+        # tok = PreTrainedTokenizerFast(vocab_file=os.path.join(tokenizer_path_old, tokenizer_file_old))
         tok.backend_tokenizer.pre_tokenizer = pre_tok
-        logger.info(f"Tokenizing using {tokenizer_path_old}/{tokenizer_file_old}")
-        ds = load_from_disk(f"/fs/cml-projects/llm-pretraining/datasets/raw/{raw_data_name}/{ext}")
-        ds = ds.select_columns("text").map(
-            extract_conversations_batched,
-            num_proc=threads,
-            batched=True,
-            batch_size=batch_size,
-            fn_kwargs={"tokenizer": tok}
-        )
+        # logger.info(f"Tokenizing using {tokenizer_path_old}/{tokenizer_file_old}")
+        # ds = load_from_disk(f"/fs/cml-projects/llm-pretraining/datasets/raw/{raw_data_name}/{ext}")
+        ds = load_from_disk(os.path.join(dataset_path, raw_data_name))
+        # ds = ds.select_columns("text").map(
+        #     extract_conversations_batched,
+        #     num_proc=threads,
+        #     batched=True,
+        #     batch_size=batch_size,
+        #     fn_kwargs={"tokenizer": tok}
+        # )
+        if raw_data_name == "genqa":
+            ds = get_genqa_data(ds, tokenizer=tok, track_role=False, threads=threads, batch_size=batch_size)
+        elif raw_data_name == "magpie_pro_300k_filtered":
+            ds = get_magpie_data(ds, tokenizer=tok, track_role=False, threads=threads, batch_size=batch_size)
+        else:
+            pass
+
         if save_tokenized_data:
-            logger.info(f"Saving tokenized dataset to: {tokenized_data_name}")
-            save_data_dir = f"/fs/cml-projects/llm-pretraining/datasets/processed/{tokenized_data_name}/{ext}"
+            save_data_dir = os.path.join(dataset_path, tokenized_data_name)
             os.makedirs(save_data_dir, exist_ok=True)
             ds.save_to_disk(save_data_dir)
 
@@ -986,17 +794,6 @@ def sort_vocab_and_print_new(mergeable_ranks: Dict[bytes, int]):
         if v >= 128000:
             print(k, v)
 
-def get_new_added_tokens(new_mergeable_ranks: Dict[bytes, int], new_merges: List[Tuple[bytes, bytes]]) -> List[bytes]:
-    new_added_tokens = []
-    for merge in new_merges:
-        rank_id1 = new_mergeable_ranks[merge[0]]
-        rank_id2 = new_mergeable_ranks[merge[1]]
-        final = merge[0]+merge[1]
-        final_id = new_mergeable_ranks[final]
-        # logger.info(f"{merge[0]}:{rank_id1} {merge[1]}:{rank_id2} {final}:{final_id}")
-        new_added_tokens.append(final)
-
-    return new_added_tokens
 
 #### PLOTTING CODE
 def extract_dataset_tokens(file_path):
@@ -1114,7 +911,12 @@ def main(args):
         raise ValueError(f"Invalid tokenizer source: {args.tokenizer_source}")
 
     pre_tok = load_pretokenizer(args.pre_tok_name)
-    ds = get_data(args.cont_or_start, args.force_retokenize, args.save_tokenized_data, args.tokenized_data_name, args.ext, args.tokenizer_path_old, args.tokenizer_file_old, args.raw_data_name, pre_tok, args.num_proc, args.batch_size)
+    ds = get_data(args.cont_or_start, args.force_retokenize, args.save_tokenized_data, 
+                  args.dataset_source_path, args.tokenized_data_name, args.ext, 
+                #   args.tokenizer_path_old, args.tokenizer_file_old, 
+                  tokenizer, base_tokenizer_path,
+                  args.raw_data_name, 
+                  pre_tok, args.num_proc, args.batch_size)
 
     old_info = read_training_info(f"{args.tokenizer_path_old}/{args.info_file_old}")
 
@@ -1128,6 +930,7 @@ def main(args):
     # save_file_name = f"new_mergeable_ranks_{new_vocab_size}"
     # save_file_name = f"info_{new_vocab_size}"
 
+    # ds = ds.select(range(1000))
     # parallelized
     start_timer = time.perf_counter()
     ds_num_tokens = sum(ds["num_tokens"])
@@ -1215,7 +1018,7 @@ def main(args):
         "old_tokenzer_info": old_tokenizer_info,
         "cont_or_start": args.cont_or_start,
     }
-    save_module.save(new_mergeable_ranks, new_merges, dataset_sizes, additional_info)
+    save_module.save(merges=new_merges, dataset_sizes=dataset_sizes, additional_info=additional_info, ranks=new_mergeable_ranks)
 
 
 def parse_args():
@@ -1256,6 +1059,20 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--dataset-source-path",
+        type=str,
+        default="/fs/cml-projects/llm-pretraining/datasets/raw/genqa/math",
+        help="Path to the raw dataset"
+    )
+    
+    # parser.add_argument(
+    #     "--dataset-save-path",
+    #     type=str,
+    #     default="/fs/cml-projects/llm-pretraining/datasets/processed/genqa_tokenized-llama3",
+    #     help="Path to save the tokenized dataset"
+    # )
+
+    parser.add_argument(
         "--pre-tok-name",
         type=str,
         default="llama3",
@@ -1266,7 +1083,7 @@ def parse_args():
     parser.add_argument(
         "--ext",
         type=str,
-        default="math",
+        default=None,
         help="Dataset extension/subset to use"
     )
 
@@ -1379,20 +1196,26 @@ def parse_args():
 
     parser.add_argument(
         "--save-interval",
-        type=int,
-        default=25,
+        type=str,
+        default="25",
         help="Number of steps between saving the tokenizer"
     )
     
     # Parse initial args
     args = parser.parse_args()
 
+    save_interval_list = args.save_interval.split(",")
+    if len(save_interval_list) == 1:
+        args.save_interval = range(args.added_tokens, step=int(args.save_interval))
+    else:
+        args.save_interval = [int(interval) for interval in save_interval_list]
+
     # Set dependent defaults
     if not hasattr(args, 'tokenized_data_name') or args.tokenized_data_name is None:
         args.tokenized_data_name = f"{args.raw_data_name}_tokenized-{args.pre_tok_name}"
     
     if not hasattr(args, 'save_loc') or args.save_loc is None:
-        args.save_loc = f"tokenizers/Llama-3.2-tokenizer-{args.raw_data_name}-{args.ext}-{args.pre_tok_name}-{args.cont_or_start}-{args.added_tokens}"
+        args.save_loc = f"tokenizers/Llama-3.2-tokenizer-{args.raw_data_name}{'-' + args.ext if args.ext is not None else ''}-{args.pre_tok_name}-{args.cont_or_start}-{args.added_tokens}"
 
     if (not hasattr(args, 'info_file_old') or args.info_file_old is None) and args.tokenizer_file_old is not None:
         args.info_file_old = args.tokenizer_file_old

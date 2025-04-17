@@ -2,51 +2,84 @@ import torch
 from typing import Dict, List, Tuple
 import os
 import shutil
+from efficient_tokenization.extend_embeddings import freeze_old_embeddings, freeze_model_except_embeddings, unfreeze_model, unfreeze_embeddings
+from peft import get_peft_model, LoraConfig, TaskType
 
 def calc_batch_size_stuff(total_batch_size: int = None, batch_size: int = None, num_processes: int = None, gradient_accumulate_every: int = None):
     if total_batch_size is not None:
         total_batch_size = total_batch_size
         if batch_size is not None:
             batch_size = batch_size
-            gradient_accumulation_steps = total_batch_size // (batch_size * num_processes)
+            gradient_accumulate_every = total_batch_size // (batch_size * num_processes)
         elif gradient_accumulate_every is not None:
-            gradient_accumulation_steps = gradient_accumulate_every
+            gradient_accumulate_every = gradient_accumulate_every
             batch_size = total_batch_size // (gradient_accumulation_steps * num_processes)
         else:
             raise ValueError("Either batch_size or gradient_accumulate_every must be provided if inferring from total_batch_size")
     else:
-        gradient_accumulation_steps = gradient_accumulate_every
-        batch_size = batch_size
-        total_batch_size = batch_size * gradient_accumulate_every * num_processes
+        if batch_size is None or gradient_accumulate_every is None:
+            raise ValueError("Both batch_size and gradient_accumulate_every must be provided total_batch_size not set")
 
     # make sure the rounding is correct
-    total_batch_size = (
-        batch_size * num_processes * gradient_accumulation_steps
-    )
+    total_batch_size = batch_size * num_processes * gradient_accumulate_every
     return total_batch_size, batch_size, gradient_accumulate_every
 
 
 def save_checkpoint(accelerator, output_dir, state_dict, logger, delete_old_checkpoints: bool = True):
-    # Delete previous checkpoints before saving new one
-    # output_dir = f"dryrun-{output_dir}"
-    if accelerator.is_main_process and delete_old_checkpoints:
-        remove_old_checkpoints(output_dir, logger)
-    accelerator.wait_for_everyone()
-    save_location = accelerator.save_state()  # accelerator handles state name
+    try:
+        # Delete previous checkpoints before saving new one
+        paths_to_delete = []
+        if delete_old_checkpoints:
+            paths_to_delete = get_checkpoint_paths(output_dir, "checkpoints")
+            logger.info(f"Removed old checkpoints from {output_dir}")
+        
+        # Make sure all processes are synchronized before saving
+        accelerator.wait_for_everyone()
+        
+        # Save the state
+        save_location = accelerator.save_state()  # accelerator handles state name
+        
+        # Make sure all processes are synchronized after save_state
+        accelerator.wait_for_everyone()
+        
+        # Save the metadata
+        if accelerator.is_main_process:
+            try:
+                torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.pt"))
+                logger.info(f"Checkpoint metadata saved to {save_location}")
+            except Exception as e:
+                logger.error(f"Error saving checkpoint metadata: {str(e)}")
+            remove_old_checkpoints(paths_to_delete, logger)
+        
+        # Final synchronization to ensure all processes complete together
+        accelerator.wait_for_everyone()
+        
+    except Exception as e:
+        logger.error(f"Error during checkpoint saving process: {str(e)}")
+        # Continue despite error since checkpoints seem to be saving correctly
 
-    torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.pt"))
-
-def remove_old_checkpoints(output_dir, logger, checkpoint_ext: str = "checkpoints"):
-    # assumes main process
+def get_checkpoint_paths(output_dir: str, checkpoint_ext: str = "checkpoints"):
+    all_checkpoint_paths = []
     checkpoint_dir = os.path.join(output_dir, checkpoint_ext)
     if os.path.exists(checkpoint_dir):
         for checkpoint in os.listdir(checkpoint_dir):
             checkpoint_path = os.path.join(checkpoint_dir, checkpoint)
-            logger.debug(f"Removing old checkpoint: {checkpoint_path}", main_process_only=False)
-            try:
-                shutil.rmtree(checkpoint_path)
-            except Exception as e:
-                logger.warning(f"Error removing checkpoint {checkpoint_path}: {e}")
+            if os.path.exists(checkpoint_path):
+                all_checkpoint_paths.append(checkpoint_path)
+    return all_checkpoint_paths
+
+def remove_old_checkpoints(output_dir: str | List[str], logger, checkpoint_ext: str = "checkpoints"):
+    # assumes main process
+    if isinstance(output_dir, str):
+        all_checkpoint_paths = get_checkpoint_paths(output_dir, checkpoint_ext)
+    else:
+        all_checkpoint_paths = output_dir
+    for checkpoint_path in all_checkpoint_paths:
+        logger.debug(f"Removing old checkpoint: {checkpoint_path}", main_process_only=False)
+        try:
+            shutil.rmtree(checkpoint_path)
+        except Exception as e:
+            logger.warning(f"Error removing checkpoint {checkpoint_path}: {e}")
 
 def calculate_grad_norm(parameters, norm_type=2.0, error_if_nonfinite=False, foreach=None, is_grad=False):
     if isinstance(parameters, torch.Tensor):
@@ -72,6 +105,8 @@ def find_all_linear_names(model):
 
     if "lm_head" in lora_module_names:
         lora_module_names.remove("lm_head")
+    if "embed_tokens" in lora_module_names:
+        lora_module_names.remove("embed_tokens")
 
     return list(lora_module_names)
 
@@ -115,11 +150,19 @@ def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor], new_tokens_mas
 
     return losses, num_tokens_per_loss_type
 
-
-def forward_pass(model, batch: Dict[str, torch.Tensor], loss_with_grad: str = "all", losses_without_grad: List[str] = [], materialize_logits: bool = True) -> Tuple[torch.Tensor, Dict[str, float], int, Dict[str, int]]:
+def forward_pass(model, 
+                 batch: Dict[str, torch.Tensor], 
+                 loss_with_grad: str = "all", 
+                 losses_without_grad: List[str] = [], 
+                 materialize_logits: bool = True,
+                 ) -> Tuple[torch.Tensor, Dict[str, float], int, Dict[str, int]]:
+    
     # THIS IS CALLED INSIDE accelerator.accumulate()
     # losses_without_grad can be "all", "translated", "new_tokens"
-    original_vocab_size = getattr(model.module.config, "original_vocab_size", 0)
+    if hasattr(model, "module"):
+        original_vocab_size = getattr(model.module.config, "original_vocab_size", 0)
+    else:
+        original_vocab_size = getattr(model.config, "original_vocab_size", 0)
     
     if original_vocab_size > 0:
         new_tokens_mask = batch["input_ids"] >= original_vocab_size # TODO check > or >=
@@ -144,13 +187,23 @@ def forward_pass(model, batch: Dict[str, torch.Tensor], loss_with_grad: str = "a
         elif loss_with_grad == "new_tokens":
             labels = batch["labels"].clone()
             labels[new_tokens_mask] = -100
+        elif loss_with_grad == "mixed":
+            # we will select the loss type based on the dataset row
+            # This collator will handle both normal and repeat samples in the same batch.
+            labels = batch["labels"].clone()
+            labels[batch["loss_mask"] == 0] = -100
+            # TODO check if this is correct
         else:
             raise ValueError(f"Invalid loss_with_grad: {loss_with_grad}")
-        # num_items_in_batch=num_items_in_batch, 
-        outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=labels, use_cache=False)
-        main_loss = outputs.loss
 
         num_items_for_loss = (labels.ne(-100)).sum().item()
+        
+        # TODO manage memory better
+        # new_tokens_mask = new_tokens_mask.cpu()
+        # batch["labels"] = batch["labels"].cpu()
+        # batch["loss_mask"] = batch["loss_mask"].cpu()
+        outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=labels, use_cache=False)
+        main_loss = outputs.loss
 
     if len(losses_without_grad) > 0:
         tracked_losses, tracked_num_tokens = calc_loss_without_grad(model, batch, new_tokens_mask, losses_without_grad, materialize_logits=materialize_logits)
@@ -180,3 +233,36 @@ def move_optimizer_to_gpu(optimizer):
                 state[k] = v.cuda()
                 del v  # Explicitly delete CPU tensor
     torch.cuda.empty_cache()
+
+
+def setup_lora(model, lora_configs, logger):
+    model = freeze_model_except_embeddings(model)
+
+    target_modules_names = lora_configs.get("target_modules", "linear")
+
+    if target_modules_names == "linear":
+        target_modules = find_all_linear_names(model)
+    elif target_modules_names == "qv":
+        target_modules = ["q_proj", "v_proj"]
+    else:
+        raise ValueError(f"Invalid target modules: {target_modules_names}")
+    
+    r = lora_configs.get("r", 16)
+    lora_alpha = lora_configs.get("lora_alpha", 64)
+    lora_dropout = lora_configs.get("lora_dropout", 0.05)
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
+    )
+
+    model = get_peft_model(model, peft_config)
+    model = unfreeze_embeddings(model)
+    model_is_frozen = True
+    logger.info(f"Lora params target_modules: {target_modules}, r: {r}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
+    
+    return model, model_is_frozen

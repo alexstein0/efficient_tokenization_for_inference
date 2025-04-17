@@ -8,6 +8,9 @@ import hashlib
 import psutil
 import argparse
 import glob
+import numpy as np
+from typing import Dict
+
 
 def setup_logging(log_level=logging.INFO):
     """Setup global logging configuration"""
@@ -94,19 +97,19 @@ def log_memory_usage(step, phase, accelerator):
                    f"Reserved: {gpu_memory_reserved:.2f}MB")
 
 
-def generate_hashed_dir_name(params_dict, output_folder="output", dry_run=False, include_num_tokens = True):
+def generate_hashed_dir_name(params_dict: Dict, dry_run=False):
     # Serialize the dictionary of parameters in a deterministic way
     params_json = json.dumps(params_dict, sort_keys=True).encode()
     params_hash = hashlib.md5(params_json).hexdigest()[:8]  # 8 chars short hash
 
     output_dir = f"{params_hash}-{params_dict['model_name']}-{params_dict['task_name']}"
-    if include_num_tokens:
-        output_dir = f"{output_dir}-{params_dict['num_new_tokens']}"
+    # if include_num_tokens:
+    output_dir = f"{output_dir}-{params_dict['num_new_tokens']}"
     
     if dry_run:
         output_dir = f"dryrun-{output_dir}"
     
-    return os.path.join(output_folder, output_dir)
+    return output_dir
 
 def get_cpus() -> int:
     # Number of threads
@@ -123,12 +126,12 @@ def get_latest_checkpoint(output_dir: str) -> str | None:
     """Find the latest checkpoint in the checkpoints directory."""
     checkpoint_dir = os.path.join(output_dir, "checkpoints")
     if not os.path.exists(checkpoint_dir):
-        logger.warning(f"No checkpoints directory found at {checkpoint_dir}")
+        # logger.warning(f"No checkpoints directory found at {checkpoint_dir}")
         return None
     
     checkpoint_paths = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*"))
     if not checkpoint_paths:
-        logger.warning(f"No checkpoints found in {checkpoint_dir}")
+        # logger.warning(f"No checkpoints found in {checkpoint_dir}")
         return None
     
     # Sort by modification time (most recent first)
@@ -144,6 +147,8 @@ def parse_args():
     args = argparse.ArgumentParser()
 
     # implementation params
+    args.add_argument("--experiment-name", type=str, default="default")
+    args.add_argument("--extra-info", type=str, default=None)
     args.add_argument("--dry-run", action="store_true")
     args.add_argument("--logging-mode", type=str, choices=["INFO", "DEBUG"], default="INFO")
     args.add_argument("--cpu-batch-size", type=int, default=1000)
@@ -153,7 +158,7 @@ def parse_args():
                      help="Path to checkpoint directory or 'latest' to let accelerate handle latest")
     args.add_argument("--wandb", type=str)
     args.add_argument("--wandb-tags", type=str)
-    args.add_argument("--seed", type=int, default=42)
+    args.add_argument("--seed", type=int, default=1234, help="Random seed for reproducibility. This seed is also used to create the output directory so different runs with the same seed will overwrite each other")
     args.add_argument("--output-dir", type=str, required=False, default=None)
     args.add_argument("--num-proc", type=int, default=threads)
     args.add_argument("--save-only", action="store_true")
@@ -162,21 +167,52 @@ def parse_args():
                     choices=["final", "all", None, "model_only"],
                     default="model_only",
                     help="Whether to save the model after training")
+    args.add_argument("--fsdp", action="store_true")
 
     # finetuning params
     args.add_argument("--dataset", type=str, default=None)
+    args.add_argument("--dataset-dir", type=str, default="datasets")
     args.add_argument("--total-batch-size", type=int, default=None)
     args.add_argument("--batch-size", type=int, default=1)
     args.add_argument("--gradient-accumulate-every", type=int, default=8)
     args.add_argument("--max-train-steps", type=int, default=-1)
     args.add_argument("--num-epochs", type=int, default=-1)
     args.add_argument("--grad-norm", type=float, default=1.0, help="Max norm for gradient clipping. Set to None to disable.")
-    args.add_argument("--lora", action="store_true")  # TODO
     args.add_argument("--deepspeed", action="store_true")  # TODO
     args.add_argument("--task-name", type=str,
                       choices=["SFT", "translation", "mixed"],
                       default="SFT",
                       help="Whether to finetune the model parameters")
+    args.add_argument("--finetune-params", type=str,
+                      choices=["full", "embeddings", "new_tokens_only", "lora", "first_last"],
+                      default="full",
+                      help="Whether to finetune the model parameters")
+    args.add_argument("--unfreeze-params-steps", type=int,
+                    default=-1,
+                    help="Steps to switch to finetuning params")
+    args.add_argument("--finetune-params-after-unfreeze", type=str,
+                      choices=["full", "embeddings", "new_tokens_only", "lora", "first_last"],
+                      default="full",
+                      help="Whether to finetune the model parameters after unfreezing")
+    args.add_argument("--reset-optimizer", action="store_true", default=False,
+                      help="Whether to reset the optimizer after unfreezing")
+
+    # lora params
+    args.add_argument("--lora-target-modules", type=str, default="linear")
+    args.add_argument("--lora-r", type=int, default=16)
+    args.add_argument("--lora-alpha", type=int, default=64)
+    args.add_argument("--lora-dropout", type=float, default=0.05)
+    
+    args.add_argument("--main-loss", type=str,
+                      choices=["all", "translated", "new_tokens", None],
+                      default=None,
+                      help="Whether to backpropagate on all losses or just some")
+    args.add_argument("--train-losses-to-track", type=str,
+                      default=None,
+                      help="List of losses to track during training")
+    args.add_argument("--eval-losses-to-track", type=str,
+                      default=None,
+                      help="List of losses to track during evaluation")
     
     # positional embeddings
     args.add_argument("--scaling-factor", type=float, default=16.0) # TODO
@@ -190,7 +226,7 @@ def parse_args():
     args.add_argument("--lr-schedule", type=str, choices=["linear", "constant"], default="linear")
     
     # Model params
-    args.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B")
+    args.add_argument("--model", type=str)
     # args.add_argument("--architecture", type=str,
     #                   choices=["llama", "mistral", "gemma"], default="llama")
     args.add_argument("--sliding-window-attention-schedule", type=str)  # TODO
@@ -202,23 +238,6 @@ def parse_args():
                      choices=["default", "random", "clone", "mean", "zeros", "merge", None],
                      default=None,
                      help="Strategy for initializing new token embeddings")
-    args.add_argument("--finetune-params", type=str,
-                      choices=["full", "embeddings", "new_tokens_only"],
-                      default="full",
-                      help="Whether to finetune the model parameters")
-    args.add_argument("--unfreeze-params-steps", type=int,
-                    default=-1,
-                    help="Steps to switch to finetuning params")
-    args.add_argument("--main-loss", type=str,
-                      choices=["all", "translated", "new_tokens", None],
-                      default=None,
-                      help="Whether to backpropagate on all losses or just some")
-    args.add_argument("--train-losses-to-track", type=str,
-                      default=None,
-                      help="List of losses to track during training")
-    args.add_argument("--eval-losses-to-track", type=str,
-                      default=None,
-                      help="List of losses to track during evaluation")
     args.add_argument("--num-new-tokens", type=int,
                       default = 0,
                       help="Number of new tokens to add when extending.  Will check for compatibility with tokenizer.")
@@ -233,9 +252,9 @@ def parse_args():
                      help="Run language model evaluation")
     args.add_argument("--eval-batch-size", type=int, default=2,
                      help="Batch size for evaluation")
-    args.add_argument("--num-fewshot", type=int, default=4,
+    args.add_argument("--num-fewshot", type=int, default=-1,
                      help="Number of fewshot examples")
-    args.add_argument("--limit", type=int, default=100,
+    args.add_argument("--limit", type=int, default=-1,
                      help="Number of samples to limit evaluation to")
     args.add_argument("--log-samples", action="store_true",
                      help="store actual samples from benchmark")
@@ -243,12 +262,12 @@ def parse_args():
                      help="Benchmark tasks to run")
     args.add_argument("--do-not-materialize-logits", action="store_true",
                      help="Whether to not materialize logits for additional time savings")
-    
+    args.add_argument("--task_list_split", type=str, default=None)
+
     args = args.parse_args()
 
     # some config validation
     args.wandb_tags = args.wandb_tags.split(",") if args.wandb_tags else None
-
     # loss tracking
 
     allowed_loss_types = ["all", "translated", "new_tokens"]
@@ -277,7 +296,7 @@ def parse_args():
         elif args.task_name == "translation":
             args.main_loss = "translated"
         elif args.task_name == "mixed":
-            raise NotImplementedError("Mixed task name not implemented")
+            args.main_loss = "mixed"
         else:
             raise ValueError(f"Invalid task name: {args.task_name}")
     return args
