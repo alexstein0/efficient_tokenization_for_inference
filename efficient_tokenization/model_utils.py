@@ -127,6 +127,7 @@ def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor], new_tokens_mas
             if loss_type == "all": 
                 labels = batch["labels"]
             elif loss_type == "translated":
+                # if loss_mask is not present, raise an error
                 if "loss_mask" not in batch:
                     raise ValueError("loss_mask not in batch")
                 labels = batch["labels"].clone()
@@ -134,6 +135,12 @@ def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor], new_tokens_mas
             elif loss_type == "new_tokens":
                 labels = batch["labels"].clone()
                 labels[new_tokens_mask] = -100
+            elif loss_type == "mixed":
+                # we will select the loss type based on the dataset row
+                # This collator will handle both normal and repeat samples in the same batch.
+                labels = batch["labels"].clone()
+                labels[batch["loss_mask"] == 0] = -100
+                # TODO check if this is correct
             else:
                 raise ValueError(f"Invalid loss_type: {loss_type}")
             
@@ -182,6 +189,8 @@ def forward_pass(model,
             labels = batch["labels"]
         elif loss_with_grad == "translated":
             # if loss_mask is not present, raise an error
+            if "loss_mask" not in batch:
+                raise ValueError("loss_mask not in batch")
             labels = batch["labels"].clone()
             labels[batch["loss_mask"] == 0] = -100
         elif loss_with_grad == "new_tokens":

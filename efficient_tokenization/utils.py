@@ -11,6 +11,8 @@ import glob
 import numpy as np
 from typing import Dict
 
+from efficient_tokenization.model_utils import remove_old_checkpoints
+
 
 def setup_logging(log_level=logging.INFO):
     """Setup global logging configuration"""
@@ -122,7 +124,7 @@ def get_cpus() -> int:
     except:
         return 1
     
-def get_latest_checkpoint(output_dir: str) -> str | None:
+def get_latest_checkpoint(output_dir: str, recursively_check = True, remove_corrupted=True) -> str | None:
     """Find the latest checkpoint in the checkpoints directory."""
     checkpoint_dir = os.path.join(output_dir, "checkpoints")
     if not os.path.exists(checkpoint_dir):
@@ -136,8 +138,20 @@ def get_latest_checkpoint(output_dir: str) -> str | None:
     
     # Sort by modification time (most recent first)
     checkpoint_paths.sort(key=os.path.getmtime, reverse=True)
-    latest = checkpoint_paths[0]
-    logger.info(f"Found latest checkpoint: {latest}")
+    latest = None
+    removed_checkpoints = []
+    for path in checkpoint_paths:
+        if os.path.exists(os.path.join(path, "checkpoint_meta.pt")):
+            latest = path
+            logger.info(f"Found latest checkpoint: {latest}")
+            break
+        else:
+            logger.warning(f"Checkpoint {path} does not have checkpoint_meta.pt {'skipping' if recursively_check else ''} {'removing' if remove_corrupted else ''}")
+            if not recursively_check:
+                return path
+            removed_checkpoints.append(path)
+    if len(removed_checkpoints) > 0 and remove_corrupted:
+        remove_old_checkpoints(removed_checkpoints, logger)
     return latest
 
 

@@ -201,6 +201,7 @@ def run_benchmark_loop(accelerator, model, config):
     theoretical_token_counts = []
     old_theoretical_token_counts = []
     for sample in samples:
+        # TODO make sure the indexes are correct
         model_produced_token_count = len(sample["input_ids"][0][0])
         theoretical_token_count = len(config["tokenizer"].encode(sample["resps"][0][0], truncation=False, padding="longest", add_special_tokens=False))
         old_theoretical_token_count = len(config["base_tokenizer"].encode(sample["resps"][0][0], truncation=False, padding="longest", add_special_tokens=False))
@@ -379,13 +380,13 @@ def evaluate(model, eval_iterator, eval_loader, accelerator, num_steps=100, eval
     
     # Run regular evaluation loop
     eval_loop_results = run_evaluation_loop(
-        model, 
-        eval_iterator, 
-        eval_loader,
-        accelerator, 
-        num_steps, 
-        eval_config.get("losses_to_track", []), 
-        eval_config.get("materialize_logits", True)
+        model = model, 
+        eval_iterator = eval_iterator, 
+        eval_loader = eval_loader,
+        accelerator = accelerator, 
+        num_steps = num_steps, 
+        loss_types = eval_config.get("losses_to_track", []), 
+        materialize_logits = eval_config.get("materialize_logits", True)
     )
 
     results.update(eval_loop_results)
@@ -418,7 +419,9 @@ def main(args):
 
     logger = setup_logging(logging_mode)
     logger.info("Running with following command:")
-    logger.info(" ".join(sys.argv))
+    command = " ".join(sys.argv)
+    command = f"accelerate launch --num_processes {num_processes} {command}"
+    logger.info(command)
 
     # initialize objects and do checks to make sure they are correct
     num_epochs = args.num_epochs
@@ -536,6 +539,7 @@ def main(args):
     ###### INIT WANDB ######
     if state.is_main_process:
         if args.wandb:
+            # TODO Resume?
             import wandb
             tags = args.wandb_tags if len(args.wandb_tags) > 0 else None
             logger.info(f"Logging to wandb with tags: {tags}")
@@ -548,7 +552,6 @@ def main(args):
             run.config.update({"output_dir" : output_dir}, allow_val_change=True)
             params_dict = {f"{k}_wandb": v for k, v in params_dict.items() if k != "output_dir"}
             run.config.update(params_dict)  # add ablation params to wandb
-            # TODO Resume?
 
     ###### RESUME FROM CHECKPOINT ######
     # this is to check if this will be a continuation of a previous run or a new run
@@ -557,6 +560,7 @@ def main(args):
     model_freezing_change_occured = False
     current_freeze_params = finetuning_params
 
+    resume_step = 0
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint == "latest":
             checkpoint_path = get_latest_checkpoint(output_dir)
@@ -714,7 +718,10 @@ def main(args):
             max_length=args.max_length if hasattr(args, 'max_length') else None
         )
         other_loss_types = []
-        eval_other_loss_types = ["mixed"]
+        if "mixed" not in eval_other_loss_types:
+            eval_other_loss_types.append("mixed")
+        if "new_tokens" not in eval_other_loss_types:
+            eval_other_loss_types.append("new_tokens")
         # we will select the loss type based on the dataset row
         # This collator will handle both normal and repeat samples in the same batch.
     else:
@@ -839,7 +846,7 @@ def main(args):
         return scheduler
 
     scheduler = init_scheduler(optim, 
-        max_train_steps, 
+        max_train_steps - resume_step, # if not resuming, this will be max_train_steps
         warmup_steps if model_freezing_change_occured else warmup_steps_prefreeze, 
         lr_schedule if model_freezing_change_occured else lr_schedule_prefreeze
         )
@@ -1132,7 +1139,7 @@ def main(args):
                     # 3) create new optimizer
                     optim = init_optimizer(unwrapped_model, lr = old_lr)
                     # 4) create or re-init your scheduler with new_optimizer
-                    scheduler = init_scheduler(optim, max_train_steps, warmup_steps, lr_schedule, current_step=update_step)
+                    scheduler = init_scheduler(optim, max_train_steps - update_step, warmup_steps, lr_schedule, current_step=update_step)
                     # 5) re-prepare these artifacts
                     model, optim, scheduler, _, _ = prepare_all_artifacts(unwrapped_model, optim, scheduler, accelerator, train_loader = None, eval_loader = None, split_scheduler = split_scheduler)
                 elif reset_optimizer:
@@ -1425,7 +1432,6 @@ def main(args):
                 "update_step": update_step,
                 "epoch": epoch,
                 "epoch_step": epoch_step,
-                "update_step": update_step,
                 "total_batched_samples": total_batched_samples,
                 "cumulative_batch_counter": cumulative_batch_counter,
                 "cumulative_token_counter": cumulative_token_counter,
