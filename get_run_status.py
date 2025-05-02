@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse, ast, json, os, re, subprocess, textwrap
 from pathlib import Path
 import torch
+import time
+import datetime
 
 # ---------------------------------------------------------------------------
 # your helper modules
@@ -53,6 +55,11 @@ TQDM_LOSS_RE = re.compile(
 PREEMPT_RE = re.compile(
     r"JOB\s+(?P<jobid>\d+)\s+ON\s+(?P<node>\S+)\s+CANCELLED\s+AT\s+(?P<ts>[0-9T:\-]+)"
 )
+
+GPU_TYPE_RE = re.compile(
+    r"accelerator distributed type \S+, num_processes \d+ on (?P<gpu>.+)"
+)
+
 array_re = re.compile(r"(?P<base>\d+)_\[(?P<inner>[^\]]+)\]")
 
 def has_safetensors_files(directory):
@@ -77,14 +84,14 @@ def get_run_status(output_dir: str) -> str:
             print(f"No files ending with '.safetensors' found in the directory {directory_path}.")
 
     if os.path.exists(os.path.join(output_dir, "checkpoints")):
-        latest_checkpoint = get_latest_checkpoint(output_dir, remove_corrupted=False, recursively_check=False)
+        latest_checkpoint, _ = get_latest_checkpoint(output_dir, recursively_check=False)
         if latest_checkpoint is not None:
             state_dict_path = os.path.join(latest_checkpoint, "checkpoint_meta.pt")
             if not os.path.exists(state_dict_path):
                 return "Training corrupted"
             train_info = torch.load(state_dict_path)
-            return f"Last checkpoint: {train_info['update_step']}"
-    return "No checkpoints found"
+            return f"Step: {train_info['update_step']}"
+    return "NONE"
 
 
 def expand_job_id(token: str) -> list[str]:
@@ -172,8 +179,23 @@ def parse_log(log_path: str | Path):
     with open(log_path, "r", errors="ignore") as f:
         lines = f.read().splitlines()
 
+    # Scan all lines for GPU type info
+    for line in reversed(lines):
+        m = GPU_TYPE_RE.search(line)
+        if m:
+            out["gpu"] = m.group("gpu")
+            break
+
     if not lines:                       # empty log
         return out
+
+    # Add last updated timestamp
+    try:
+        mtime = log_path.stat().st_mtime
+        out["last_updated"] = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        out["last_updated"] = "-"
+
 
     for line in lines[:40]:
         m = OUTDIR_RE.search(line)
@@ -229,7 +251,7 @@ def merge_state(job_slurm_state: str,
         # ----------- STATE -----------
         slurm_lower = job_slurm_state.lower()
         if slurm_lower == "running":
-            state = f"RUNNING ({live_info['node']})"                       # nothing overrides RUNNING
+            state = f"RUNNING" #({live_info['node']})"                       # nothing overrides RUNNING
         elif slurm_lower == "pending":
             state = "PENDING" + (" (preempt)" if live_info.get("cancelled") else "")
         elif slurm_lower == "completing":
@@ -241,9 +263,10 @@ def merge_state(job_slurm_state: str,
         # ----------- PROGRESS --------
         p = live_info["progress"]
         if p:
-            progress = (f"{p['pct']:>3d}%  "
-                        f"{p['step']}/{p['total']}  "
-                        f"{p['metric']}={p['loss']:.3f}")
+            progress = (f"{p['pct']:>3d}% "
+                        f"{p['step']}/{p['total']}"
+                        # f"{p['metric']}={p['loss']:.3f}"
+                        )
         else:
             progress = "-"
     else:
@@ -309,7 +332,7 @@ def live_status_map() -> dict[str,dict]:
         if not hashed_dir:
             continue
         
-        log_info["state"] = state.lower()
+        # log_info["state"] = state.lower()
         info["log"] = f"{LOG_DIR.name}/{log_path.name}"
         info["jid"] = info.get("jid")
         info["node"] = info.get("node")
@@ -325,18 +348,12 @@ def fmt_progress(p: dict|None) -> str:
         return "-"
     return (f"{p['pct']:>3d}%  "
             f"{p['step']}/{p['total']}  "
-            f"{p['metric']}={p['loss']:.3f}")
+            # f"{p['metric']}={p['loss']:.3f}"
+            )
 
 # --------------------------------------------------------------------------- main
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("launcher_file",
-                        help="file that contains the sbatch / accelerate lines")
-    parser.add_argument("-o","--output-root", default="output",
-                        help="root directory that holds run folders")
-    parser.add_argument("--incomplete-only", action="store_true",
-                        help="only show incomplete runs")
-    args = parser.parse_args()
+def main(args: argparse.Namespace) -> None:
+
 
     # Part A – live map
     live = live_status_map()
@@ -355,7 +372,10 @@ def main() -> None:
         live_info = live.get(hashed_dir, None)
 
         if static_status == "Final model exists":
-            slurm_state = "FINISHED"
+            if live_info.get("state", None) == "running":
+                slurm_state = "COMPLETING"
+            else:
+                slurm_state = "FINISHED"
         elif live_info:
             slurm_state = live_info["state"]
         else:
@@ -372,26 +392,55 @@ def main() -> None:
 
         logfile = live_info["log"] if live_info else "-"
         info_list = []
+        eta = "-"
         if live_info:
             if live_info['node'] is not None:
-                info_list.append(f"node={live_info['node']:10s}")
+                info_list.append(f"{live_info['node']:5s}")
             if "--num_processes" in pre_args:
-                info_list.append(f"gpus={pre_args['--num_processes']:3s}")
+                info_list.append(f"#gpus={pre_args['--num_processes']:2s}")
             if 'ts' in live_info and live_info['ts'] is not None:
                 info_list.append(f"update={live_info['ts']:10s}")
+            if "gpu" in live_info:
+                info_list.append(f"gpu={live_info['gpu']}")
+            if live_info['progress'] is not None and slurm_state == "running":
+                eta = live_info['progress']['eta']
         info_str = " ".join(info_list)
-        rows.append((hashed_dir, static_status, state, progress, logfile, info_str))
+        last_updated = live_info["last_updated"] if live_info and "last_updated" in live_info else "-"
+        rows.append((hashed_dir, static_status, state, progress, logfile, last_updated, eta, info_str))
 
     # nice output
     if len(rows) == 0:
         print("No runs found")
         return
-    hdr   = ["RUN_DIR","CHECKPOINT","SLURM","PROGRESS","LOG","INFO"]
-    col_w = [max(len(r[i]) for r in rows) for i in range(len(hdr))]
-    print(" | ".join(h.ljust(col_w[i]) for i, h in enumerate(hdr)))
-    print("-+-".join("-"*w for w in col_w))
+    hdr   = ["RUN_DIR","CHECKPOINT","SLURM","PROGRESS","LOG","UPDATED", "ETA", "INFO"]
+    col_w = [max(max(len(str(r[i])), len(hdr[i])) for r in rows) for i in range(len(hdr))]
+    output_str = f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    output_str += " | ".join(h.ljust(col_w[i]) for i, h in enumerate(hdr)) + "\n"
+    output_str += "-+-".join("-"*w for w in col_w) + "\n"
     for r in rows:
-        print(" | ".join(r[i].ljust(col_w[i]) for i in range(len(hdr))))
+        output_str += " | ".join(str(r[i]).ljust(col_w[i]) for i in range(len(hdr))) + "\n"
+    return output_str
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("launcher_file",
+                        help="file that contains the sbatch / accelerate lines")
+    parser.add_argument("-o","--output-root", default="output",
+                        help="root directory that holds run folders")
+    parser.add_argument("--incomplete-only", action="store_true",
+                        help="only show incomplete runs")
+    parser.add_argument("--watch", type=int, metavar="SECONDS",
+                    help="re-run and refresh every N seconds")
+    args = parser.parse_args()
+    if args.watch:
+        try:
+            while True:
+                table = main(args)
+                os.system("clear")
+                print(table)
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+    else:
+        table = main(args)
+        print(table)

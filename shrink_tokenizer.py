@@ -24,7 +24,7 @@ def run_tokenizer_shrink(args):
     num_new_tokens_list = args.num_new_tokens_list
     for num_new_tokens in num_new_tokens_list:
         path = get_new_path(num_new_tokens, original_tokenizer_path)
-        sm.shrink_tokenizer(num_new_tokens, merges, sizes, new_path=path)
+        sm.shrink_tokenizer(num_new_tokens, merges, sizes, new_path=path, added_tokens=args.add_special_tokens)
 
 
 if __name__ == "__main__":
@@ -32,6 +32,7 @@ if __name__ == "__main__":
     parser.add_argument("--old-tokenizer-path", type=str, required=True)
     # parser.add_argument("--new-tokenizer-path", type=str, required=True)
     parser.add_argument("--num-new-tokens-list", type=str, required=True, default="1,5,20,50,100,200,300,400,500,600,700,800,900")
+    parser.add_argument("--add-special-tokens", action="store_true")
     args = parser.parse_args()
     args.num_new_tokens_list = [int(x) for x in args.num_new_tokens_list.split(",")]
     run_tokenizer_shrink(args)

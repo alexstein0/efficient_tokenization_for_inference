@@ -1,6 +1,6 @@
 import logging
 
-from efficient_tokenization.tokenize_simple import my_tokenize, get_genqa_data, get_tokenizer, create_translation_dataset, get_magpie_data
+from efficient_tokenization.tokenize_simple import my_tokenize, get_genqa_data, get_tokenizer, get_magpie_data, apply_chat_template, create_translation_dataset_with_template
 from datasets import load_from_disk, concatenate_datasets
 from transformers import AutoTokenizer
 import copy
@@ -10,6 +10,7 @@ import psutil
 import argparse
 from typing import List
 import numpy as np
+from chat_templating import visualize_loss_mask
 
 def setup_logging(log_level=logging.INFO):
     """Setup global logging configuration"""
@@ -145,19 +146,27 @@ def main(args):
     base_tokenizer = None
     if args.tokenizer_path is not None:
         # load tokenizer from vocab file
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-            logger.info(f"Loaded HF tokenizer from vocab file: {args.tokenizer_path}")
-        except:
-            base_tokenizer = AutoTokenizer.from_pretrained(args.model)
-            vocab_file_path = args.tokenizer_path
-            pre_tok_name = args.pre_tok_name
-            tokenizer = get_tokenizer(vocab_file_path, pre_tok_name=pre_tok_name, old_tokenizer=base_tokenizer)
-            logger.info(f"Loaded tokenizer from .model file: {vocab_file_path} and pre_tok_name: {pre_tok_name}")
+        # try:
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+        logger.info(f"Loaded HF tokenizer from vocab file: {args.tokenizer_path}")
+        base_tokenizer = AutoTokenizer.from_pretrained(args.model)
+        logger.info(f"Loaded base tokenizer from model: {args.model}")
+        # except:
+        #     base_tokenizer = AutoTokenizer.from_pretrained(args.model)
+        #     vocab_file_path = args.tokenizer_path
+        #     pre_tok_name = args.pre_tok_name
+        #     tokenizer = get_tokenizer(vocab_file_path, pre_tok_name=pre_tok_name, old_tokenizer=base_tokenizer)
+        #     logger.info(f"Loaded tokenizer from .model file: {vocab_file_path} and pre_tok_name: {pre_tok_name}")
     else:
         # get original_tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         logger.info(f"Loaded tokenizer from model: {args.model}")
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if base_tokenizer.pad_token is None:
+        base_tokenizer.pad_token = base_tokenizer.eos_token
 
 
     # Get Dataset
@@ -166,20 +175,26 @@ def main(args):
 
     logger.info(f"Downloading dataset from: {dataset_path}")
     ds = load_from_disk(dataset_path)
-    print(ds)
+
+    if args.dry_run:
+        ds = ds.select(range(100))
     
+    print(ds)
     ds = get_preprocessed_data(ds, args)
 
     print(f"tasks: {args.task}")
     # this block is the only thing that is dataset specific
     ds_dict = {}
     if "default" in args.task:
-        ds_dict["default"] = ds
+        ds_dict["default"] = apply_chat_template(ds, tokenizer, args.cpu_batch_size, args.num_proc)
+        print(visualize_loss_mask(ds_dict["default"]["input_ids"][0], ds_dict["default"]["loss_mask"][0], tokenizer))
 
     if "translation" in args.task:
         if base_tokenizer is None:
             base_tokenizer = AutoTokenizer.from_pretrained(args.model)
-        ds_dict["translation"] = create_translation_dataset(ds, base_tokenizer, tokenizer, args.cpu_batch_size, args.num_proc)
+        ds_dict["translation"] = create_translation_dataset_with_template(ds, base_tokenizer, tokenizer, args.cpu_batch_size, args.num_proc)
+
+        print(visualize_loss_mask(ds_dict["translation"]["input_ids"][0], ds_dict["translation"]["loss_mask"][0], tokenizer))
 
     changed_dataset = False
     final_ds_list = []
@@ -196,7 +211,7 @@ def main(args):
         ds, changed_dataset = preprocess_dataset(ds, args, tokenizer, logger, task_name)
 
         # save dataset
-        if args.save_dataset_name and changed_dataset: 
+        if args.save_dataset_name and changed_dataset and not args.dry_run: 
             logger.info(f"Saving dataset to {dataset_path}")
             ds.save_to_disk(dataset_path)
 
@@ -209,6 +224,26 @@ def main(args):
     # del ds_list
     # del mixed_ds_list
 
+def test_magpie_preprocessing():
+    """Test the preprocessing pipeline with magpie data"""
+    class Args:
+        def __init__(self):
+            self.raw_data_name = "magpie"
+            self.dataset_path = "datasets/magpie_pro_300k_filtered"
+            self.save_dataset_name = "tokenized_1"
+            self.task = "default,translation"
+            self.model = "meta-llama/Llama-3.2-1B-Instruct"
+            self.tokenizer_path = "/cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/Llama-3.2-tokenizer-genqa-math-empty-start-1"
+            self.cpu_batch_size = 1000
+            # self.num_proc = 24
+            self.save_dataset_dir = "datasets"
+            self.force_tokenize = True
+            self.pre_tok_name = None
+            self.truncate = None
+
+    args = Args()
+    args.task = args.task.split(",")
+    main(args)
 
 if __name__ == "__main__":
     try:
@@ -231,10 +266,12 @@ if __name__ == "__main__":
     args.add_argument("--pretokenizer-name", type=str)
     args.add_argument("--force-tokenize", action="store_true")
     args.add_argument("--task", type=str, default="default")
+    args.add_argument("--dry-run", action="store_true")
     # args.add_argument("--task_list_split", type=str, default=None)
     args = args.parse_args()
 
     args.task = args.task.split(",")
+    print(args)
 
     # if args.task_list_split is None:
     #     print(f"WARNING: task_list_split is None, using uniform split")

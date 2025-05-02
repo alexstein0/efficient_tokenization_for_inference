@@ -7,7 +7,8 @@ import psutil
 from datasets import load_dataset, load_from_disk
 import datasets
 datasets.disable_caching()
-from chat_templating import apply_chat_template_to_repeat, get_llama_base_chat_template, get_llama_instruct_chat_template
+# from chat_templating_old import apply_chat_template_to_repeat, get_llama_base_chat_template, get_llama_instruct_chat_template
+from chat_templating import apply_chat_template_repeat, apply_chat_template_normal, get_llama32_instruct_chat_template, get_llama32_repeat_chat_template
 import os
 import copy
 
@@ -35,19 +36,36 @@ def extract_genqa(example_list: List[List[Dict[str, str]]], track_role: bool = F
         output.append(" ".join(raw_messages))
     return output
 
-def extract_magpie(example_list: List[List[List[Dict[str, str]]]], track_role: bool = False) -> List[List[str]]:
+def extract_magpie(example_list: List[List[List[Dict[str, str]]]], track_role: bool = False, flattened: bool = False) -> List[List[str]]:
     output = []
-    for text in example_list:
-        raw_messages = []
-        for message in text:
-            this_message = ""
-            if track_role and message.get('from') is not None:
-                this_message += f'<|{message.get("from")}|> '
-            content = message.get('value', '').strip()
-            this_message += content
-            raw_messages.append(this_message.strip())
-        # raw_messages = [message.get('content', '').strip() for message in text if message.get('content')]
-        output.append(" ".join(raw_messages))
+    role_map = {
+        'human': 'user',
+        'gpt': 'assistant',
+        'system': 'system',
+    }
+    if flattened:
+        for text in example_list:
+            raw_messages = []
+            for message in text:
+                this_message = ""
+                if track_role and message.get('from') is not None:
+                    from_role = role_map[message.get('from')]
+                    this_message += f'<|{from_role}|> '
+                content = message.get('value', '').strip()
+                this_message += content
+                raw_messages.append(this_message.strip())
+            # raw_messages = [message.get('content', '').strip() for message in text if message.get('content')]
+            output.append(" ".join(raw_messages))
+    else:
+        for conversation in example_list:
+            out_conversation = []
+            for message in conversation:
+                out_message = {}
+                if track_role and message.get('from') is not None:
+                    out_message['role'] = role_map[message.get('from')]
+                out_message['content'] = message.get('value', '').strip()
+                out_conversation.append(out_message)
+            output.append(out_conversation)
     return output
 
 
@@ -91,7 +109,7 @@ def flatten_magpie_conversations(example: Dict[str, List[List[Dict[str, str]]]],
     """
 
     text_col = example.get('conversations', [])
-    extracted_texts = extract_magpie(text_col, track_role)
+    extracted_texts = extract_magpie(text_col, track_role, flattened=False)
 
     if tokenizer is not None:
         all_texts, lengths = tokenize_text_with_pretokenizer(extracted_texts, tokenizer)
@@ -339,77 +357,111 @@ def init_tokenizer(tokenizer_path):
     extended_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
 
-def create_translation_dataset(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int) -> datasets.Dataset:
-    meta_prompt = """Repeat the following text: """
-    meta_prompt_tok = base_tokenizer(meta_prompt)
+# def create_translation_dataset(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int) -> datasets.Dataset:
+#     meta_prompt = """Repeat the following text: """
+#     meta_prompt_tok = base_tokenizer(meta_prompt)
 
-    text1_label = "text1: "
-    text1_label_tok = base_tokenizer(text1_label, add_special_tokens=False)
-    text2_label = "text2: "
-    text2_label_tok = base_tokenizer(text2_label, add_special_tokens=False)
+#     text1_label = "text1: "
+#     text1_label_tok = base_tokenizer(text1_label, add_special_tokens=False)
+#     text2_label = "text2: "
+#     text2_label_tok = base_tokenizer(text2_label, add_special_tokens=False)
     
-    def tokenize_function(examples):
-        global extended_tokenizer
-        batch_size = len(examples["text"])
-        row_texts = list(examples["text"])
+#     def tokenize_function(examples):
+#         global extended_tokenizer
+#         batch_size = len(examples["text"])
+#         row_texts = list(examples["text"])
         
-        text_tok1 = base_tokenizer(row_texts, add_special_tokens=False)
-        text_tok2 = extended_tokenizer(row_texts, add_special_tokens=False)
+#         text_tok1 = base_tokenizer(row_texts, add_special_tokens=False)
+#         text_tok2 = extended_tokenizer(row_texts, add_special_tokens=False)
         
-        combined_text = []
-        combined_input_ids = []
-        combined_attention_mask = []
-        combined_loss_mask = []
+#         combined_text = []
+#         combined_input_ids = []
+#         combined_attention_mask = []
+#         combined_loss_mask = []
         
-        for i in range(batch_size):
-            text = (meta_prompt + 
-                    text1_label + 
-                    row_texts[i] + 
-                    text2_label +
-                    row_texts[i]
-                    )
-            input_ids = (
-                meta_prompt_tok['input_ids'] + 
-                text1_label_tok['input_ids'] +
-                text_tok1['input_ids'][i] +
-                text2_label_tok['input_ids'] + 
-                text_tok2['input_ids'][i]
-            )
-            attention_mask = (
-                meta_prompt_tok['attention_mask'] + 
-                text1_label_tok['attention_mask'] +
-                text_tok1['attention_mask'][i] +
-                text2_label_tok['attention_mask'] +
-                text_tok2['attention_mask'][i]
-            )
-            mask_loss = (
-                [0 for _ in meta_prompt_tok['attention_mask']] + 
-                [0 for _ in text1_label_tok['attention_mask']] +
-                [0 for _ in text_tok1['attention_mask'][i]] +
-                [0 for _ in text2_label_tok['attention_mask']] +
-                [1 for _ in text_tok2['attention_mask'][i]]
-            )
+#         for i in range(batch_size):
+#             text = (meta_prompt + 
+#                     text1_label + 
+#                     row_texts[i] + 
+#                     text2_label +
+#                     row_texts[i]
+#                     )
+#             input_ids = (
+#                 meta_prompt_tok['input_ids'] + 
+#                 text1_label_tok['input_ids'] +
+#                 text_tok1['input_ids'][i] +
+#                 text2_label_tok['input_ids'] + 
+#                 text_tok2['input_ids'][i]
+#             )
+#             attention_mask = (
+#                 meta_prompt_tok['attention_mask'] + 
+#                 text1_label_tok['attention_mask'] +
+#                 text_tok1['attention_mask'][i] +
+#                 text2_label_tok['attention_mask'] +
+#                 text_tok2['attention_mask'][i]
+#             )
+#             mask_loss = (
+#                 [0 for _ in meta_prompt_tok['attention_mask']] + 
+#                 [0 for _ in text1_label_tok['attention_mask']] +
+#                 [0 for _ in text_tok1['attention_mask'][i]] +
+#                 [0 for _ in text2_label_tok['attention_mask']] +
+#                 [1 for _ in text_tok2['attention_mask'][i]]
+#             )
             
-            combined_text.append(text)
-            combined_input_ids.append(input_ids)
-            combined_attention_mask.append(attention_mask)
-            combined_loss_mask.append(mask_loss)
+#             combined_text.append(text)
+#             combined_input_ids.append(input_ids)
+#             combined_attention_mask.append(attention_mask)
+#             combined_loss_mask.append(mask_loss)
 
-        return {
-            "text": combined_text,
-            "input_ids": combined_input_ids,
-            "attention_mask": combined_attention_mask,
-            "labels": combined_input_ids.copy(),
-            "loss_mask": combined_loss_mask,
-        }
+#         return {
+#             "text": combined_text,
+#             "input_ids": combined_input_ids,
+#             "attention_mask": combined_attention_mask,
+#             "labels": combined_input_ids.copy(),
+#             "loss_mask": combined_loss_mask,
+#         }
 
-    if isinstance(tokenizer_input, str):
-        # Initialize the tokenizer before mapping
-        init_tokenizer(tokenizer_input)
-    else:
-        # When using an object, make it available globally
-        global extended_tokenizer
-        extended_tokenizer = tokenizer_input
+#     if isinstance(tokenizer_input, str):
+#         # Initialize the tokenizer before mapping
+#         init_tokenizer(tokenizer_input)
+#     else:
+#         # When using an object, make it available globally
+#         global extended_tokenizer
+#         extended_tokenizer = tokenizer_input
+        
+#     tokenized_dataset = ds.map(
+#         tokenize_function,
+#         batched=True,
+#         batch_size=batch_size,
+#         num_proc=threads,
+#         remove_columns=ds.column_names,
+#         desc="Creating translation dataset",
+#         cache_file_name=None
+#     )
+    
+#     return tokenized_dataset
+
+def create_translation_dataset_with_template(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int) -> datasets.Dataset:
+    chat_template = get_llama32_repeat_chat_template()
+    def tokenize_function(examples):
+        tokenized_texts = apply_chat_template_repeat(
+            base_tokenizer=base_tokenizer,
+            second_tokenizer=tokenizer_input,
+            conversation=examples["text"],
+            chat_template=chat_template,
+            # return_assistant_tokens_mask=True,
+            add_generation_prompt=False,
+            return_tensors="pt",
+        )
+        return tokenized_texts
+
+    # if isinstance(tokenizer_input, str):
+    #     # Initialize the tokenizer before mapping
+    #     init_tokenizer(tokenizer_input)
+    # else:
+    #     # When using an object, make it available globally
+    #     global extended_tokenizer
+    #     extended_tokenizer = tokenizer_input
         
     tokenized_dataset = ds.map(
         tokenize_function,
@@ -423,34 +475,28 @@ def create_translation_dataset(ds: datasets.Dataset, base_tokenizer: AutoTokeniz
     
     return tokenized_dataset
 
-def create_translation_dataset_with_template(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int) -> datasets.Dataset:
-    chat_template = get_llama_base_chat_template()
+def apply_chat_template(ds: datasets.Dataset, tokenizer: AutoTokenizer, batch_size: int, threads: int) -> datasets.Dataset:
+    chat_template = get_llama32_instruct_chat_template()
     def tokenize_function(examples):
-        global extended_tokenizer
-        messages = [
-            [{
-                "content": x
-            }]  for x in examples["text"]
-        ]
-        tokenized_texts = apply_chat_template_to_repeat(
-            base_tokenizer=base_tokenizer,
-            second_tokenizer=extended_tokenizer,
-            chat_template=chat_template,
-            conversation=messages,
+        tokenized_texts = apply_chat_template_normal(
+            tokenizer=tokenizer,
+            conversation=examples["text"],
+            add_generation_prompt=False,
             return_assistant_tokens_mask=True,
-            add_generation_prompt=True,
-            return_dict=True,
+            chat_template=chat_template, # can change to base template
+            tokenize=True,
+            return_tensors="pt",
+            padding="longest",
+            truncation=True,
         )
         return tokenized_texts
-
-    if isinstance(tokenizer_input, str):
-        # Initialize the tokenizer before mapping
-        init_tokenizer(tokenizer_input)
-    else:
-        # When using an object, make it available globally
-        global extended_tokenizer
-        extended_tokenizer = tokenizer_input
-        
+        # return {
+        #     "input_ids": tokenized_texts["input_ids"], 
+        #     "loss_mask": tokenized_texts["loss_mask"],
+        #     "attention_mask": tokenized_texts["attention_mask"],
+        #     "labels": tokenized_texts["input_ids"].clone(),
+        #     }
+    
     tokenized_dataset = ds.map(
         tokenize_function,
         batched=True,

@@ -9,9 +9,7 @@ import psutil
 import argparse
 import glob
 import numpy as np
-from typing import Dict
-
-from efficient_tokenization.model_utils import remove_old_checkpoints
+from typing import Dict, Tuple, List
 
 
 def setup_logging(log_level=logging.INFO):
@@ -124,35 +122,34 @@ def get_cpus() -> int:
     except:
         return 1
     
-def get_latest_checkpoint(output_dir: str, recursively_check = True, remove_corrupted=True) -> str | None:
+def get_latest_checkpoint(output_dir: str, recursively_check = True) -> Tuple[str| None, List[str]]:
     """Find the latest checkpoint in the checkpoints directory."""
     checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    checkpoints_to_remove = []
     if not os.path.exists(checkpoint_dir):
         # logger.warning(f"No checkpoints directory found at {checkpoint_dir}")
-        return None
+        return None, checkpoints_to_remove
     
     checkpoint_paths = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*"))
     if not checkpoint_paths:
         # logger.warning(f"No checkpoints found in {checkpoint_dir}")
-        return None
+        return None, checkpoints_to_remove
     
     # Sort by modification time (most recent first)
     checkpoint_paths.sort(key=os.path.getmtime, reverse=True)
     latest = None
-    removed_checkpoints = []
     for path in checkpoint_paths:
         if os.path.exists(os.path.join(path, "checkpoint_meta.pt")):
             latest = path
             logger.info(f"Found latest checkpoint: {latest}")
             break
         else:
-            logger.warning(f"Checkpoint {path} does not have checkpoint_meta.pt {'skipping' if recursively_check else ''} {'removing' if remove_corrupted else ''}")
+            logger.info(f"Checkpoint {path} does not have checkpoint_meta.pt {'skipping' if recursively_check else ''}")
             if not recursively_check:
-                return path
-            removed_checkpoints.append(path)
-    if len(removed_checkpoints) > 0 and remove_corrupted:
-        remove_old_checkpoints(removed_checkpoints, logger)
-    return latest
+                return path, checkpoints_to_remove
+            checkpoints_to_remove.append(path)
+
+    return latest, checkpoints_to_remove
 
 
 def parse_args():
@@ -197,19 +194,21 @@ def parse_args():
                       choices=["SFT", "translation", "mixed"],
                       default="SFT",
                       help="Whether to finetune the model parameters")
-    args.add_argument("--finetune-params", type=str,
-                      choices=["full", "embeddings", "new_tokens_only", "lora", "first_last"],
-                      default="full",
-                      help="Whether to finetune the model parameters")
     args.add_argument("--unfreeze-params-steps", type=int,
                     default=-1,
                     help="Steps to switch to finetuning params")
-    args.add_argument("--finetune-params-after-unfreeze", type=str,
+    args.add_argument("--finetune-params", type=str,
                       choices=["full", "embeddings", "new_tokens_only", "lora", "first_last"],
                       default="full",
                       help="Whether to finetune the model parameters after unfreezing")
+    args.add_argument("--finetune-params-prefreeze", type=str,
+                      choices=["full", "embeddings", "new_tokens_only", "lora", "first_last"],
+                      default="full",
+                      help="Whether to finetune the model parameters")
     args.add_argument("--reset-optimizer", action="store_true", default=False,
                       help="Whether to reset the optimizer after unfreezing")
+    args.add_argument("--log-step", type=int, default=0,
+                      help="step number for logging purposes.  Defaults to 0, but can be overridden by checkpoint loading")
 
     # lora params
     args.add_argument("--lora-target-modules", type=str, default="linear")
@@ -237,10 +236,13 @@ def parse_args():
     # LR 
     args.add_argument("--learning-rate", type=float, default=2e-5)
     args.add_argument("--warmup-steps", type=int, default=10)
-    args.add_argument("--lr-schedule", type=str, choices=["linear", "constant"], default="linear")
+    args.add_argument("--warmup-steps-prefreeze", type=int, default=-1)
+    args.add_argument("--lr-schedule", type=str, choices=["linear", "constant", "cosine"], default="linear")
+    args.add_argument("--lr-schedule-prefreeze", type=str, choices=["linear", "constant", "cosine"], default="constant")
     
     # Model params
     args.add_argument("--model", type=str)
+    args.add_argument("--original-model", type=str, default=None)
     # args.add_argument("--architecture", type=str,
     #                   choices=["llama", "mistral", "gemma"], default="llama")
     args.add_argument("--sliding-window-attention-schedule", type=str)  # TODO
@@ -258,10 +260,12 @@ def parse_args():
 
 
     # EVAL PARAMS
-    args.add_argument("--eval-steps", type=int, default=1000,
+    args.add_argument("--eval-steps", type=int, default=100,
                      help="Number of steps between evaluations")
     args.add_argument("--eval-iters", type=int, default=100,
                      help="Number of iterations to run for evaluation")
+    args.add_argument("--benchmark-steps", type=int, default=1000,
+                     help="Number of steps between evaluations")
     args.add_argument("--run-lm-eval", action="store_true",
                      help="Run language model evaluation")
     args.add_argument("--eval-batch-size", type=int, default=2,
@@ -313,6 +317,10 @@ def parse_args():
             args.main_loss = "mixed"
         else:
             raise ValueError(f"Invalid task name: {args.task_name}")
+        
+    if args.original_model is None:
+        args.original_model = args.model
+    
     return args
 
 

@@ -6,7 +6,7 @@ python train_tokenizer.py \
     --cont-or-start start \
     --batch-size 1000 \
     --added-tokens 100 \
-    --tokenizer-path-old meta-llama/Llama-3.2-1B \
+    --tokenizer-path-old meta-llama/Llama-3.2-1B-Instruct \
     --tokenizer-source huggingface
 
 python shrink_tokenizer.py \

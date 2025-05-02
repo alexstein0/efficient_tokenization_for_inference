@@ -7,10 +7,10 @@ from datasets import Dataset
 import base64
 
 from efficient_tokenization.tokenize_simple import pretokenizer_to_config, load_pretokenizer
+from transformers.tokenization_utils_base import AddedToken
 
 
-
-def save_tokenizer_to_huggingface(original_tokenizer: PreTrainedTokenizerFast, new_tokenizer_path: str, new_tokenizer_json: dict):
+def save_tokenizer_to_huggingface(original_tokenizer: PreTrainedTokenizerFast, new_tokenizer_path: str, new_tokenizer_json: dict, save_added_tokens: List = None):
     # 2️⃣ Define new save path
     os.makedirs(new_tokenizer_path, exist_ok=True)
 
@@ -20,6 +20,67 @@ def save_tokenizer_to_huggingface(original_tokenizer: PreTrainedTokenizerFast, n
     tokenizer_json_path = os.path.join(new_tokenizer_path, "tokenizer.json")
     with open(tokenizer_json_path, "w") as f:
         json.dump(new_tokenizer_json, f, indent=2)
+
+    # if save_added_tokens is not None:
+
+    #     with open(os.path.join(new_tokenizer_path, "tokenizer_config.json"), "r") as f:
+    #         tokenizer_config = json.load(f)
+        
+    #     new_added_tokens_decoder = {}
+    #     for added_token in new_tokenizer_json["added_tokens"]:
+    #         added_tok_dict = {
+    #             "content": added_token["content"],
+    #             "lstrip": added_token["lstrip"],
+    #             "normalized": added_token["normalized"],
+    #             "rstrip": added_token["rstrip"],
+    #             "single_word": added_token["single_word"],
+    #             "special": added_token["special"],
+    #         }
+    #         new_added_tokens_decoder[added_token["id"]] = added_tok_dict
+    #     tokenizer_config["added_tokens_decoder"] = new_added_tokens_decoder
+
+    #     with open(os.path.join(new_tokenizer_path, "tokenizer_config.json"), "w") as f:
+    #         json.dump(tokenizer_config, f, indent=2)
+
+def save_tokenizer_to_huggingface_with_objects(original_tokenizer: PreTrainedTokenizerFast, new_tokenizer_path: str, new_vocab: Dict[bytes, int] = None, new_merges: List[Tuple[bytes, bytes]] = None, new_added_tokens: List[bytes] = None, new_pretokenizer: pre_tokenizers.PreTokenizer | str = None):
+
+    os.makedirs(new_tokenizer_path, exist_ok=True)
+
+    if new_added_tokens is not None:
+        original_tokenizer.add_special_tokens({"additional_special_tokens": new_added_tokens})
+
+    tokenizer_json = json.loads(original_tokenizer._tokenizer.to_str())
+    if new_vocab is not None:
+        tokenizer_json["model"]["vocab"] = new_vocab
+    
+    if new_merges is not None:
+        tokenizer_json["model"]["merges"] = new_merges
+
+    if new_pretokenizer is not None:
+        tokenizer_json["pre_tokenizer"] = new_pretokenizer
+
+    original_tokenizer.save_pretrained(new_tokenizer_path)
+    tokenizer_json_path = os.path.join(new_tokenizer_path, "tokenizer.json")
+    with open(tokenizer_json_path, "w") as f:
+        json.dump(tokenizer_json, f, indent=2)
+
+    # if save_added_tokens is not None:
+        
+    #     new_added_tokens_decoder = {}
+    #     for added_token in new_tokenizer_json["added_tokens"]:
+    #         added_tok_dict = {
+    #             "content": added_token["content"],
+    #             "lstrip": added_token["lstrip"],
+    #             "normalized": added_token["normalized"],
+    #             "rstrip": added_token["rstrip"],
+    #             "single_word": added_token["single_word"],
+    #             "special": added_token["special"],
+    #         }
+    #         new_added_tokens_decoder[added_token["id"]] = added_tok_dict
+    #     tokenizer_config["added_tokens_decoder"] = new_added_tokens_decoder
+
+    #     with open(os.path.join(new_tokenizer_path, "tokenizer_config.json"), "w") as f:
+    #         json.dump(tokenizer_config, f, indent=2)
 
 
 def read_tokenizer_from_model(path: str):
@@ -64,15 +125,73 @@ def read_training_info(path: str) -> dict:
         print(f"Error loading training info from {path}")
         return {}
 
-def save_tokenizer_new(info_dict: Dict[str, Any], save_dir: str, prior_tokenizer: str | PreTrainedTokenizerFast, pretok_override = None):
+def save_tokenizer_new(info_dict: Dict[str, Any], save_dir: str, prior_tokenizer: str | PreTrainedTokenizerFast, pretok_override = None, with_added_tokens: bool = False):
     os.makedirs(save_dir, exist_ok=True)
     print(f"Saving tokenizer to {save_dir}")
     if isinstance(prior_tokenizer, str):
         prior_tokenizer = AutoTokenizer.from_pretrained(prior_tokenizer)
-    new_tokenizer_info = convert_tokenizer_to_huggingface_correct(info_dict, prior_tokenizer, pretok_override)
-    save_tokenizer_to_huggingface(prior_tokenizer, save_dir, new_tokenizer_info)
+    if with_added_tokens:
+        new_vocab, new_merges, new_added_tokens, pre_tok_config = convert_tokenizer_to_huggingface_with_added_tokens(info_dict, prior_tokenizer, pretok_override)
+        save_tokenizer_to_huggingface_with_objects(prior_tokenizer, save_dir, new_vocab=new_vocab, new_merges=new_merges, new_added_tokens=new_added_tokens, new_pretokenizer=pre_tok_config)
+    else:
+        new_tokenizer_info = convert_tokenizer_to_huggingface_correct(info_dict, prior_tokenizer, pretok_override)
+        save_tokenizer_to_huggingface(prior_tokenizer, save_dir, new_tokenizer_info, with_added_tokens)
 
-### Read and save tokenizer in .model files
+def convert_tokenizer_to_huggingface_with_added_tokens(new_tokenizer_info: Dict[str, Any], original_tokenizer: PreTrainedTokenizerFast, pretok_override = None):
+    # must get original tokenizer from huggingface
+    tokenizer_json = json.loads(original_tokenizer._tokenizer.to_str())
+    
+    # old_vocab = tokenizer_json["model"]["vocab"]
+    # starting_index = len(tokenizer.get_vocab())
+    old_merges = tokenizer_json["model"]["merges"]
+
+    # Extract vocab (token: index)
+    old_vocab = original_tokenizer.get_vocab()
+    
+    # load new_tokenizer_info_path
+    # new_tokenizer_info = read_training_info(new_tokenizer_info_path)
+    # get merges and new_tokens
+    new_merges = new_tokenizer_info["merges"]
+    new_tokens = new_tokenizer_info["new_tokens"]
+
+    # Update vocab (append at the next available ID)
+    new_vocab = {**old_vocab}  # Copy the old vocab
+
+    new_vocab_sorted = dict(sorted(new_vocab.items(), key=lambda item: item[1]))
+
+    joined_merges = [x for x in old_merges]
+    joined_merges.extend(new_merges)
+
+    new_added_tokens = []
+    for index, added_tok in original_tokenizer.added_tokens_decoder.items():
+        # added_tok_dict = {
+        #     "id": index,
+        #     "content": added_tok.content,
+        #     "lstrip": added_tok.lstrip,
+        #     "normalized": added_tok.normalized,
+        #     "rstrip": added_tok.rstrip,
+        #     "single_word": added_tok.single_word,
+        #     "special": added_tok.special,
+        # }
+        # new_added_tokens.append(added_tok_dict)
+        new_added_tokens.append(added_tok.content)
+        new_vocab_sorted[added_tok.content] = index
+
+    starting_index = max(new_vocab_sorted.values()) + 1
+    for i, tok in enumerate(new_tokens):
+        # added_token = AddedToken(content=tok, special=False, lstrip=False, normalized=False, rstrip=False, single_word=False)
+        # new_added_tokens.append(added_token)
+        new_vocab_sorted[tok] = starting_index + i
+
+    # new_tokenizer_json = {**tokenizer_json}
+    # new_tokenizer_json["model"]["vocab"] = new_vocab_sorted
+    # new_tokenizer_json["model"]["merges"] = joined_merges
+    # new_tokenizer_json["added_tokens"] = new_added_tokens
+    pre_tok_config = None
+    if pretok_override is not None:
+        pre_tok_config = pretokenizer_to_config(pretok_override)
+    #     new_tokenizer_json["pre_tokenizer"] = pre_tok_config
+    return new_vocab_sorted, joined_merges, new_added_tokens, pre_tok_config
 
 
 def convert_tokenizer_to_huggingface_correct(new_tokenizer_info: Dict[str, Any], original_tokenizer: PreTrainedTokenizerFast, pretok_override = None):
@@ -176,9 +295,9 @@ class SaveModule:
         # TODO save_loc can be set later
         return cls(save_loc=new_path, original_tokenizer=static_info["base_tokenizer_path"], original_ds_size=static_info["original_dataset_size"], pretokenizer=static_info["pretokenizer_name"], static_info=static_info)
 
-    def shrink_tokenizer(self, num_new_tokens: int, merges: List[Tuple[bytes, bytes]], dataset_sizes: List[int], additional_info: Dict[str, Any] = {}, ranks: Dict[bytes, int] = None, new_path: str = None):
+    def shrink_tokenizer(self, num_new_tokens: int, merges: List[Tuple[bytes, bytes]], dataset_sizes: List[int], additional_info: Dict[str, Any] = {}, ranks: Dict[bytes, int] = None, new_path: str = None, added_tokens: bool = False):
         assert num_new_tokens is not None, "num_new_tokens must be provided"
-        assert num_new_tokens < len(merges), "num_new_tokens must be less than the original increase in vocab size"
+        assert num_new_tokens <= len(merges), "num_new_tokens must be less than the original increase in vocab size"
         new_merges = merges[:num_new_tokens]
         new_dataset_sizes = dataset_sizes[:num_new_tokens]
         new_ranks = None
@@ -193,9 +312,9 @@ class SaveModule:
             self.save_loc = new_path
             print(f"Setting save_loc to {self.save_loc}")
 
-        self.save(merges=new_merges, dataset_sizes=new_dataset_sizes, additional_info=additional_info, ranks=new_ranks, num_added_tokens=num_new_tokens)
+        self.save(merges=new_merges, dataset_sizes=new_dataset_sizes, additional_info=additional_info, ranks=new_ranks, num_added_tokens=num_new_tokens, with_added_tokens=added_tokens)
 
-    def save(self, merges: List[Tuple[bytes, bytes]], dataset_sizes: List[int], additional_info: Dict[str, Any] = {}, ranks: Dict[bytes, int] = None, num_added_tokens: int = None):
+    def save(self, merges: List[Tuple[bytes, bytes]], dataset_sizes: List[int], additional_info: Dict[str, Any] = {}, ranks: Dict[bytes, int] = None, num_added_tokens: int = None, with_added_tokens: bool = False):
         new_added_tokens = get_new_added_tokens(new_merges=merges, new_mergeable_ranks=ranks)
         if ranks is not None:
             num_added_tokens = len(ranks) - self.initial_vocab_size
@@ -220,11 +339,12 @@ class SaveModule:
 
         if self.original_tokenizer is not None:
             # will never be none, better check wll be f we allow the .model files to be used
-            save_tokenizer_new(training_info, self.save_loc, self.original_tokenizer, pretok_override=self.pretokenizer)
+            save_tokenizer_new(training_info, self.save_loc, self.original_tokenizer, pretok_override=self.pretokenizer, with_added_tokens=with_added_tokens)
         else:
             save_tokenizer(training_info, self.save_loc)
 
         save_training_info(training_info, self.save_loc)
+
 
 
 # def cut_tokenizer_to_size(tokenizer: PreTrainedTokenizerFast, size: int):
@@ -356,3 +476,5 @@ def compare_dicts(dict1: Dict, dict2: Dict) -> bool:
         return False
         
     return True
+
+

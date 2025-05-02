@@ -24,43 +24,70 @@ def calc_batch_size_stuff(total_batch_size: int = None, batch_size: int = None, 
     total_batch_size = batch_size * num_processes * gradient_accumulate_every
     return total_batch_size, batch_size, gradient_accumulate_every
 
+def move_old_checkpoints_to_temp(output_dir: str, paths_to_delete: List[str], temp_dir_name: str = "temp_checkpoints", new_name: str = None) -> List[str]:
+    temp_dir = os.path.join(output_dir, temp_dir_name)
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
 
-def save_checkpoint(accelerator, output_dir, state_dict, logger, delete_old_checkpoints: bool = True):
-    try:
+    all_temp_paths = []
+    for path in paths_to_delete:
+        if new_name is not None:
+            temp_path = os.path.join(temp_dir, new_name)
+        else:
+            temp_path = os.path.join(temp_dir, os.path.basename(path))
+        shutil.move(path, temp_path)
+        all_temp_paths.append(temp_path)
+
+    return all_temp_paths
+
+def save_checkpoint(accelerator, output_dir, state_dict, logger, delete_old_checkpoints: bool = True, special_save_location_name: str = None):
         # Delete previous checkpoints before saving new one
-        paths_to_delete = []
-        if delete_old_checkpoints:
-            paths_to_delete = get_checkpoint_paths(output_dir, "checkpoints")
-            logger.info(f"Removed old checkpoints from {output_dir}")
-        
-        # Make sure all processes are synchronized before saving
-        accelerator.wait_for_everyone()
-        
-        # Save the state
-        save_location = accelerator.save_state()  # accelerator handles state name
-        
-        # Make sure all processes are synchronized after save_state
-        accelerator.wait_for_everyone()
-        
-        # Save the metadata
+    paths_to_delete = []
+    if delete_old_checkpoints:
+        checkpoint_dir = os.path.join(output_dir, "checkpoints")
+        paths_to_delete = get_checkpoint_paths(checkpoint_dir)
+        # logger.info(f"Removed old checkpoints from {output_dir}")
+        logger.info(f"Found old checkpoints to delete: {paths_to_delete}")
         if accelerator.is_main_process:
-            try:
-                torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.pt"))
-                logger.info(f"Checkpoint metadata saved to {save_location}")
-            except Exception as e:
-                logger.error(f"Error saving checkpoint metadata: {str(e)}")
+            paths_to_delete = move_old_checkpoints_to_temp(output_dir, paths_to_delete)
+    
+    # Make sure all processes are synchronized before saving
+    accelerator.wait_for_everyone()
+    
+    # Save the state
+    save_location = accelerator.save_state()  # accelerator handles state name
+    
+    # Make sure all processes are synchronized after save_state
+    accelerator.wait_for_everyone()
+    
+    # Save the metadata
+    try:
+        if accelerator.is_main_process:
+            save_training_state_dict(save_location, state_dict, logger)
             remove_old_checkpoints(paths_to_delete, logger)
-        
-        # Final synchronization to ensure all processes complete together
-        accelerator.wait_for_everyone()
-        
     except Exception as e:
         logger.error(f"Error during checkpoint saving process: {str(e)}")
-        # Continue despite error since checkpoints seem to be saving correctly
+    
+    # Final synchronization to ensure all processes complete together
+    accelerator.wait_for_everyone()
 
-def get_checkpoint_paths(output_dir: str, checkpoint_ext: str = "checkpoints"):
+    if special_save_location_name is not None:
+        # if keeping specific training states
+        save_location = move_old_checkpoints_to_temp(output_dir, [save_location], temp_dir_name = "kept_training_states", new_name = special_save_location_name)
+    
+    accelerator.wait_for_everyone()
+
+def save_training_state_dict(save_location, state_dict, logger):
+    # Must be main process
+    try:
+        torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.pt"))
+        logger.info(f"Checkpoint metadata saved to {save_location}")
+    except Exception as e:
+        logger.error(f"Error saving checkpoint metadata: {str(e)}")
+
+
+def get_checkpoint_paths(checkpoint_dir: str):
     all_checkpoint_paths = []
-    checkpoint_dir = os.path.join(output_dir, checkpoint_ext)
     if os.path.exists(checkpoint_dir):
         for checkpoint in os.listdir(checkpoint_dir):
             checkpoint_path = os.path.join(checkpoint_dir, checkpoint)
@@ -69,30 +96,27 @@ def get_checkpoint_paths(output_dir: str, checkpoint_ext: str = "checkpoints"):
     return all_checkpoint_paths
 
 def remove_old_checkpoints(output_dir: str | List[str], logger, checkpoint_ext: str = "checkpoints"):
-    # assumes main process
+    # MUST BE MAIN PROCESS
     if isinstance(output_dir, str):
-        all_checkpoint_paths = get_checkpoint_paths(output_dir, checkpoint_ext)
+        checkpoint_dir = os.path.join(output_dir, checkpoint_ext)
+        all_checkpoint_paths = get_checkpoint_paths(checkpoint_dir)
     else:
         all_checkpoint_paths = output_dir
     for checkpoint_path in all_checkpoint_paths:
-        logger.debug(f"Removing old checkpoint: {checkpoint_path}", main_process_only=False)
+        logger.debug(f"Removing old checkpoint: {checkpoint_path}")
         try:
             shutil.rmtree(checkpoint_path)
         except Exception as e:
             logger.warning(f"Error removing checkpoint {checkpoint_path}: {e}")
 
-def calculate_grad_norm(parameters, norm_type=2.0, error_if_nonfinite=False, foreach=None, is_grad=False):
+def calculate_norm(parameters, norm_type=2.0, error_if_nonfinite=False, foreach=None):
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
         # prevent generators from being exhausted
         parameters = list(parameters)
-    if not is_grad:
-        grads = [p.grad for p in parameters if p.grad is not None]
-    else:
-        grads = parameters
-    # print(f"parameters: {[p.shape for p in parameters]}, grads:{[g.shape for g in grads]}, {grads}")
-    total_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
+    
+    total_norm = torch.nn.utils.get_total_norm(parameters, norm_type, error_if_nonfinite, foreach)
     return total_norm
 
 
@@ -111,7 +135,7 @@ def find_all_linear_names(model):
     return list(lora_module_names)
 
 
-def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor], new_tokens_mask: torch.Tensor, loss_types: List[str], materialize_logits: bool = True) -> Tuple[Dict[str, float], Dict[str, int]]:
+def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor | List[str]], new_tokens_mask: torch.Tensor, loss_types: List[str], materialize_logits: bool = True) -> Tuple[Dict[str, float], Dict[str, int]]:
     model.eval()
     losses = {}
     num_tokens_per_loss_type = {}
@@ -134,7 +158,7 @@ def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor], new_tokens_mas
                 labels[batch["loss_mask"] == 0] = -100
             elif loss_type == "new_tokens":
                 labels = batch["labels"].clone()
-                labels[new_tokens_mask] = -100
+                labels[~new_tokens_mask] = -100
             elif loss_type == "mixed":
                 # we will select the loss type based on the dataset row
                 # This collator will handle both normal and repeat samples in the same batch.
@@ -158,7 +182,7 @@ def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor], new_tokens_mas
     return losses, num_tokens_per_loss_type
 
 def forward_pass(model, 
-                 batch: Dict[str, torch.Tensor], 
+                 batch: Dict[str, torch.Tensor | List[str]], 
                  loss_with_grad: str = "all", 
                  losses_without_grad: List[str] = [], 
                  materialize_logits: bool = True,
@@ -195,7 +219,7 @@ def forward_pass(model,
             labels[batch["loss_mask"] == 0] = -100
         elif loss_with_grad == "new_tokens":
             labels = batch["labels"].clone()
-            labels[new_tokens_mask] = -100
+            labels[~new_tokens_mask] = -100
         elif loss_with_grad == "mixed":
             # we will select the loss type based on the dataset row
             # This collator will handle both normal and repeat samples in the same batch.

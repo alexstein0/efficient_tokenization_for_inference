@@ -106,23 +106,30 @@ def convert_argparse_to_values(args, num_processes: int = 1):
     # ablation params are:
     model_name = args.model.split('/')[-1] # 0. model
     tokenizer_path = args.tokenizer_path # 1. tokenizer_path
-    finetuning_params = args.finetune_params # 1. finetune_params
+    finetune_params = args.finetune_params # 1. finetune_params
     embedding_init_strategy = args.embedding_init_strategy # 2. embedding_init_strategy
-    dry_run = args.dry_run # 3. dry_run
+    # dry_run = args.dry_run # 3. dry_run
     # total_batch_size = args.total_batch_size # 4. total_batch_size
     learning_rate = args.learning_rate # 5. learning_rate
     task_name = args.task_name # 6. task_name
     main_loss_type = args.main_loss # 7. main_loss
     num_new_tokens = args.num_new_tokens # 8. num_new_tokens
-    if args.unfreeze_params_steps is None or args.unfreeze_params_steps <= 0 or args.finetune_params_after_unfreeze == args.finetune_params:
-        # logger.info(f"Unfreezing params after unfreeze step is not set or is the same as finetune params after unfreeze, so we will not unfreeze params")
-        finetune_params_after_unfreeze = None
+    # prefreeze params
+    if args.unfreeze_params_steps is None or args.unfreeze_params_steps <= 0 or args.finetune_params_prefreeze == args.finetune_params:
+        finetune_params_prefreeze = None
         reset_optimizer = False
         unfreeze_params_steps = -1
+        warmup_steps_prefreeze = -1
+        lr_schedule_prefreeze = None
+        will_unfreeze_params = False
     else:
-        finetune_params_after_unfreeze = args.finetune_params_after_unfreeze
+        finetune_params_prefreeze = args.finetune_params_prefreeze
         reset_optimizer = args.reset_optimizer
         unfreeze_params_steps = args.unfreeze_params_steps
+        warmup_steps_prefreeze = args.warmup_steps_prefreeze if args.warmup_steps_prefreeze > -1 else unfreeze_params_steps // 10
+        lr_schedule_prefreeze = args.lr_schedule_prefreeze  # this is not part of logging
+        will_unfreeze_params = True
+
     dataset_str = args.dataset
     seed = args.seed
     warmup_steps = args.warmup_steps
@@ -131,20 +138,22 @@ def convert_argparse_to_values(args, num_processes: int = 1):
     params_dict = {
         "model_name": model_name,
         "task_name": task_name,
-        "finetuning_params": finetuning_params,
+        "finetuning_params": finetune_params,
         "total_batch_size": total_batch_size,
         "learning_rate": learning_rate,
         "main_loss_type": main_loss_type,
         "embedding_init_strategy": embedding_init_strategy,
         "num_new_tokens": num_new_tokens,
         "unfreeze_params_steps": unfreeze_params_steps,
-        "finetune_params_after_unfreeze": finetune_params_after_unfreeze,
+        "finetune_params_prefreeze": finetune_params_prefreeze,
         "dataset": dataset_str,
         "tokenizer_path": tokenizer_path,
         "seed": seed,
         "reset_optimizer": reset_optimizer,
         "warmup_steps": warmup_steps,
-        "lr_schedule": lr_schedule
+        "lr_schedule": lr_schedule,
+        "warmup_steps_prefreeze": warmup_steps_prefreeze,
+        "lr_schedule_prefreeze": lr_schedule_prefreeze,
     }
 
     lora_configs = {
@@ -153,7 +162,7 @@ def convert_argparse_to_values(args, num_processes: int = 1):
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout
     }
-    if finetune_params_after_unfreeze == "lora" or finetuning_params == "lora":
+    if finetune_params_prefreeze == "lora" or finetune_params == "lora":
         params_dict.update(lora_configs)
 
     return params_dict
@@ -172,6 +181,48 @@ def convert_argparse_to_hash_path(args, accelerate_args = {}, output_folder = "o
 
     output_dir = os.path.join(output_folder, hashed_file_name)
     return output_dir
+
+def convert_results_into_new_token_metrics(results, task_names, tokenizer, base_tokenizer) -> Dict[str, Dict[str, Any]]:
+    outputs = {}
+    for task_name in task_names:
+        samples = results["samples"][task_name]
+        filter_val = samples[0]["filter"]
+        metrics = samples[0]["metrics"]
+        metrics = [f"{m},{filter_val}" for m in metrics]
+
+        result_metrics = results["results"][task_names[0]]
+        model_token_counts = []
+        theoretical_token_counts = []
+        old_theoretical_token_counts = []
+        new_token_counts = []
+        for sample in samples:
+            # TODO make sure the indexes are correct
+            input_ids = [int(x) for x in sample["input_ids"][0][0].split(",")]
+            model_produced_token_count = len(input_ids)
+            theoretical_token_count = len(tokenizer.encode(sample["resps"][0][0], truncation=False, padding="longest", add_special_tokens=False))
+            old_theoretical_token_count = len(base_tokenizer.encode(sample["resps"][0][0], truncation=False, padding="longest", add_special_tokens=False))
+            model_token_counts.append(model_produced_token_count)
+            theoretical_token_counts.append(theoretical_token_count)
+            old_theoretical_token_counts.append(old_theoretical_token_count)
+            # Count number of new tokens in input_ids
+            new_token_id_start = len(base_tokenizer)
+            num_new_tokens = sum(1 for tid in input_ids if tid >= new_token_id_start)
+            new_token_counts.append(num_new_tokens)
+
+        metrics_dict = {}
+        for metric in metrics:
+            metrics_dict[metric] = result_metrics[metric]
+
+        outputs[task_name] = {
+            "metrics": metrics_dict,
+            "model_token_counts": model_token_counts,
+            "theoretical_token_counts": theoretical_token_counts,
+            "old_theoretical_token_counts": old_theoretical_token_counts,
+            "new_token_counts": new_token_counts,
+        }
+
+    return outputs
+
 
 def add_baseline_lm_eval(file_args_obj, pre_args: Dict):
     model_path = file_args_obj.model
@@ -198,7 +249,8 @@ def add_baseline_lm_eval(file_args_obj, pre_args: Dict):
 
 
 def get_lm_eval_string(output_dir: str, 
-                       tokenizer_path: str = None, 
+                       tokenizer_path: str = None,
+                       base_tokenizer_path: str = None,
                        tasks: List[str] = ["minerva_math"],
                        num_processes: int = 8,
                        limit: int = -1,
@@ -208,15 +260,19 @@ def get_lm_eval_string(output_dir: str,
                        num_fewshot: int = -1,
                        experiment: str = None,
                        ) -> str:
-    model_args_str = f"pretrained={output_dir},tokenizer={tokenizer_path}" if tokenizer_path is not None else f"pretrained={output_dir}"
-    return f"""accelerate launch --num_processes {num_processes} -m lm_eval \
+    model_args_str = (f"pretrained={output_dir},tokenizer={tokenizer_path}") if tokenizer_path is not None else f"pretrained={output_dir}"
+    extra_config_str = (f"--extra config base_tokenizer={base_tokenizer_path}") if base_tokenizer_path is not None else ""
+    return f"""accelerate launch --num_processes {num_processes} -m lm_eval_new_tokens \
+    --model hf
     --model_args {model_args_str} \
     --gen_kwargs do_sample=False,temperature=0.0,top_p=1.0 \
     --tasks {",".join(tasks)} \
     --batch_size auto \
     --output_path ./eval_results{"" if experiment == None or len(experiment) == 0 else f"/{experiment}"} \
+    --apply_chat_template \
     {'--log_samples ' if log_samples else ''} \
     {'--limit ' + str(limit) if limit > 0 else ''} \
     {'--cache_requests true ' if cache_requests else ''} \
     {'--show_config ' if show_config else ''} \
-    {'--num_fewshot ' + str(num_fewshot) if num_fewshot > 0 else ''}"""
+    {'--num_fewshot ' + str(num_fewshot) if num_fewshot > 0 else ''} \
+    {extra_config_str}"""

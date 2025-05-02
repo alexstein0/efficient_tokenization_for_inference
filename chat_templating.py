@@ -1,314 +1,526 @@
-from typing import Union, List, Dict, Optional, Any
-
+from typing import List, Dict, Union, Optional, Any
 from transformers import AutoTokenizer
-from transformers.tokenization_utils_base import BatchEncoding, TensorType
+from transformers.tokenization_utils_base import BatchEncoding, TensorType, PaddingStrategy
 from transformers.utils.chat_template_utils import _compile_jinja_template, _render_with_assistant_indices
-import re
-import copy
 
+def get_llama32_instruct_chat_template() -> str:
+    template = """{{- bos_token }}
+{%- if custom_tools is defined %}
+    {%- set tools = custom_tools %}
+{%- endif %}
+{%- if not tools_in_user_message is defined %}
+    {%- set tools_in_user_message = true %}
+{%- endif %}
+{%- if not date_string is defined %}
+    {%- if strftime_now is defined %}
+        {%- set date_string = strftime_now("%d %b %Y") %}
+    {%- else %}
+        {%- set date_string = "26 Jul 2024" %}
+    {%- endif %}
+{%- endif %}
+{%- if not tools is defined %}
+    {%- set tools = none %}
+{%- endif %}
 
+{#- This block extracts the system message, so we can slot it into the right place. #}
+{%- if messages[0]['role'] == 'system' %}
+    {%- set system_message = messages[0]['content']|trim %}
+    {%- set messages = messages[1:] %}
+{%- else %}
+    {%- set system_message = "" %}
+{%- endif %}
 
-def get_llama_base_chat_template():
-    fake_system_prompt = """You are a helpful AI assistant well versed in repeating the message back to them in an equivalent but more efficient way. The original message will be indicated by 'text to repeat:' and end with 'end text.'  The repeat section will be indicated by 'repeat:'"""
-    template_list = [
-        {
-            "name": "base_template",
-            "tokenizer": "base",
-            "template": f"""<|begin_of_text|>{fake_system_prompt}\n"""
-        },
-        {
-            "name": "original_message_template",
-            "tokenizer": "base",
-            "template": """text to repeat: {{ messages[0].content }} end text. \nrepeat: """
-        },
-        {
-            "name": "new_message_template",
-            "tokenizer": "second",
-            "template": """{% generation %}{{ messages[0].content }}{% endgeneration %}"""
-        },
-        
-    ]
-    return template_list
+{#- System message #}
+{{- "<|start_header_id|>system<|end_header_id|>\n\n" }}
+{%- if tools is not none %}
+    {{- "Environment: ipython\n" }}
+{%- endif %}
+{{- "Cutting Knowledge Date: December 2023\n" }}
+{{- "Today Date: " + date_string + "\n\n" }}
+{%- if tools is not none and not tools_in_user_message %}
+    {{- "You have access to the following functions. To call a function, please respond with JSON for a function call." }}
+    {{- 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.' }}
+    {{- "Do not use variables.\n\n" }}
+    {%- for t in tools %}
+        {{- t | tojson(indent=4) }}
+        {{- "\n\n" }}
+    {%- endfor %}
+{%- endif %}
+{{- system_message }}
+{{- "<|eot_id|>" }}
 
-# example templates from llama
-def get_llama_instruct_chat_template():
-    #"chat_template" = "{% set loop_messages = messages %}
-    # {% for message in loop_messages %}
-    # {% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}
-    # {% if loop.index0 == 0 %}
-    # {% set content = bos_token + content %}
-    # {% endif %}
-    # {{ content }}
-    # {% endfor %}
-    # {% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}",
-    template_list = [
-        {
-            "name": "base_template",
-            "tokenizer": "base",
-            "template": """<|begin_of_text|><|start_header_id|>system<|end_header_id|>}
+{#- Custom tools are passed in a user message with some extra guidance #}
+{%- if tools_in_user_message and not tools is none %}
+    {#- Extract the first user message so we can plug it in here #}
+    {%- if messages | length != 0 %}
+        {%- set first_user_message = messages[0]['content']|trim %}
+        {%- set messages = messages[1:] %}
+    {%- else %}
+        {{- raise_exception("Cannot put tools in the first user message when there's no first user message!") }}
+    {%- endif %}
+    {{- '<|start_header_id|>user<|end_header_id|>\n\n' -}}
+    {{- "Given the following functions, please respond with a JSON for a function call " }}
+    {{- "with its proper arguments that best answers the given prompt.\n\n" }}
+    {{- 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.' }}
+    {{- "Do not use variables.\n\n" }}
+    {%- for t in tools %}
+        {{- t | tojson(indent=4) }}
+        {{- "\n\n" }}
+    {%- endfor %}
+    {{- first_user_message + "<|eot_id|>" }}
+{%- endif %}
 
-    You are a helpful AI assistant well versed in repeating the user's question back to them in a different but equivalent way.<|eot_id|>"""
-        },
-        {
-            "name": "original_message_template",
-            "tokenizer": "base",
-            "template": """<|start_header_id|>user<|end_header_id|>
+{%- for message in messages %}
+    {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}
+        {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' + message['content']|trim + '<|eot_id|>' }}
+    {%- elif 'tool_calls' in message %}
+        {%- if not message.tool_calls|length == 1 %}
+            {{- raise_exception("This model only supports single tool-calls at once!") }}
+        {%- endif %}
+        {%- set tool_call = message.tool_calls[0].function %}
+        {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+        {{- '{"name": "' + tool_call.name + '", ' }}
+        {{- '"parameters": ' }}
+        {{- tool_call.arguments | tojson }}
+        {{- "}" }}
+        {{- "<|eot_id|>" }}
+    {%- elif message.role == "tool" or message.role == "ipython" %}
+        {{- "<|start_header_id|>ipython<|end_header_id|>\n\n" }}
+        {%- if message.content is mapping or message.content is iterable %}
+            {{- message.content | tojson }}
+        {%- else %}
+            {{- message.content }}
+        {%- endif %}
+        {{- "<|eot_id|>" }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+{%- endif %}
+"""
+    return template
 
-    {{ message.content }}<|eot_id|><|start_header_id|>assistent<|end_header_id|>"""
-        },
-        {
-            "name": "new_message_template",
-            "tokenizer": "second",
-            "template": """{% generation %}{{ message.content }}{% endgeneration %}"""
-        },
-        {
-            "name": "end_message_template",
-            "tokenizer": "base",
-            "template": """<|eot_id|>"""
-        } 
-    ]
-    return template_list
+def get_llama32_instruct_chat_template_minimal() -> str:
+    template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
-def apply_chat_template_to_repeat(
-        base_tokenizer,
-        second_tokenizer,
-        # conversation: Union[List[Dict[str, str]], List[List[Dict[str, str]]]],
-        conversation: str | List[str],  # just the string to be used as the message (repeated)
-        # tools: Optional[List[Dict]] = None,
-        # documents: Optional[List[Dict[str, str]]] = None,
-        chat_template:  str|List[Dict[str, str]], # not optional anymore
-        add_generation_prompt: bool = False,
-        continue_final_message: bool = False,
-        tokenize: bool = True,
-        # padding: bool = False,
-        # truncation: bool = False,
-        # max_length: Optional[int] = None,
-        return_tensors: Optional[Union[str, TensorType]] = None,
-        return_dict: bool = False,
-        return_assistant_tokens_mask: bool = False,
-        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> Union[str, List[int], List[str], List[List[int]], BatchEncoding, List[Dict[str, List]]]:
-        """
-        Converts a list of dictionaries with `"role"` and `"content"` keys to a list of token
-        ids. This method is intended for use with chat models, and will read the tokenizer's chat_template attribute to
-        determine the format and control tokens to use when converting.
+{{ system_message | default("You are a helpful assistant.") }}<|eot_id|>{% for message in messages %}<|start_header_id|>{{ message.role }}<|end_header_id|>
 
-        Args:
-            conversation (Union[List[Dict[str, str]], List[List[Dict[str, str]]]]): A list of dicts
-                with "role" and "content" keys, representing the chat history so far.
-            tools (`List[Dict]`, *optional*):
-                A list of tools (callable functions) that will be accessible to the model. If the template does not
-                support function calling, this argument will have no effect. Each tool should be passed as a JSON Schema,
-                giving the name, description and argument types for the tool. See our
-                [chat templating guide](https://huggingface.co/docs/transformers/main/en/chat_templating#automated-function-conversion-for-tool-use)
-                for more information.
-            documents (`List[Dict[str, str]]`, *optional*):
-                A list of dicts representing documents that will be accessible to the model if it is performing RAG
-                (retrieval-augmented generation). If the template does not support RAG, this argument will have no
-                effect. We recommend that each document should be a dict containing "title" and "text" keys. Please
-                see the RAG section of the [chat templating guide](https://huggingface.co/docs/transformers/main/en/chat_templating#arguments-for-RAG)
-                for examples of passing documents with chat templates.
-            chat_template (`str`, *optional*):
-                A Jinja template to use for this conversion. It is usually not necessary to pass anything to this
-                argument, as the model's template will be used by default.
-            add_generation_prompt (bool, *optional*):
-                If this is set, a prompt with the token(s) that indicate
-                the start of an assistant message will be appended to the formatted output. This is useful when you want to generate a response from the model.
-                Note that this argument will be passed to the chat template, and so it must be supported in the
-                template for this argument to have any effect.
-            continue_final_message (bool, *optional*):
-                If this is set, the chat will be formatted so that the final
-                message in the chat is open-ended, without any EOS tokens. The model will continue this message
-                rather than starting a new one. This allows you to "prefill" part of
-                the model's response for it. Cannot be used at the same time as `add_generation_prompt`.
-            tokenize (`bool`, defaults to `True`):
-                Whether to tokenize the output. If `False`, the output will be a string.
-            padding (`bool`, defaults to `False`):
-                Whether to pad sequences to the maximum length. Has no effect if tokenize is `False`.
-            truncation (`bool`, defaults to `False`):
-                Whether to truncate sequences at the maximum length. Has no effect if tokenize is `False`.
-            max_length (`int`, *optional*):
-                Maximum length (in tokens) to use for padding or truncation. Has no effect if tokenize is `False`. If
-                not specified, the tokenizer's `max_length` attribute will be used as a default.
-            return_tensors (`str` or [`~utils.TensorType`], *optional*):
-                If set, will return tensors of a particular framework. Has no effect if tokenize is `False`. Acceptable
-                values are:
-                - `'tf'`: Return TensorFlow `tf.Tensor` objects.
-                - `'pt'`: Return PyTorch `torch.Tensor` objects.
-                - `'np'`: Return NumPy `np.ndarray` objects.
-                - `'jax'`: Return JAX `jnp.ndarray` objects.
-            return_dict (`bool`, defaults to `False`):
-                Whether to return a dictionary with named outputs. Has no effect if tokenize is `False`.
-            tokenizer_kwargs (`Dict[str: Any]`, *optional*): Additional kwargs to pass to the tokenizer.
-            return_assistant_tokens_mask (`bool`, defaults to `False`):
-                Whether to return a mask of the assistant generated tokens. For tokens generated by the assistant,
-                the mask will contain 1. For user and system tokens, the mask will contain 0.
-                This functionality is only available for chat templates that support it via the `{% generation %}` keyword.
-            **kwargs: Additional kwargs to pass to the template renderer. Will be accessible by the chat template.
+{% if message.role == "assistant" %}
+{% generation %}
+{{ message.content }}
+{% endgeneration %}
+{% else %}
+{{ message.content }}
+{% endif %}
+<|eot_id|>{% endfor %}{% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>
 
-        Returns:
-            `Union[List[int], Dict]`: A list of token ids representing the tokenized chat so far, including control tokens. This
-            output is ready to pass to the model, either directly or via methods like `generate()`. If `return_dict` is
-            set, will return a dict of tokenizer outputs instead.
-        """
+{% generation %} {% endgeneration %}<|eot_id|>{% endif %}"""
+    return template
 
-        if return_dict and not tokenize:
-            raise ValueError(
-                "`return_dict=True` is incompatible with `tokenize=False`, because there is no dict "
-                "of tokenizer outputs to return."
+def get_llama32_repeat_chat_template() -> str:
+    template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a helpful assistant who repeats the given question and answer exactly.<|eot_id|>{% for message in messages %}<|start_header_id|>{{ message.role }}<|end_header_id|>
+
+{% if message.role == "assistant" %}
+{% generation %}
+{{ message.content }}
+{% endgeneration %}
+{% else %}
+{{ message.content }}
+{% endif %}
+<|eot_id|>{% endfor %}{% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>
+
+{% generation %} {% endgeneration %}<|eot_id|>{% endif %}"""
+    return template
+
+def apply_chat_template_normal(
+    tokenizer: AutoTokenizer,
+    conversation: Union[List[Dict[str, str]], List[List[Dict[str, str]]]],
+    chat_template: Optional[str] = None,
+    add_generation_prompt: bool = False,
+    return_assistant_tokens_mask: bool = False,
+    tokenize: bool = True,
+    return_tensors: Optional[Union[str, TensorType]] = None,
+    padding: Union[bool, str, PaddingStrategy] = False,
+    truncation: bool = False,
+    max_length: Optional[int] = None,
+    return_dict: bool = True,
+    tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+    add_system_message: bool = True,
+) -> Union[str, Dict[str, Any]]:
+    """
+    Normal chat templating (instruction fine-tuning case).
+    """
+    if tokenizer_kwargs is None:
+        tokenizer_kwargs = {}
+
+    if chat_template is None:
+        chat_template = get_llama32_instruct_chat_template()
+
+    compiled_template = _compile_jinja_template(chat_template)
+
+    if isinstance(conversation, (list, tuple)) and isinstance(conversation[0], dict):
+        conversations = [conversation]
+        is_batched = False
+    else:
+        conversations = conversation
+        is_batched = True
+
+    rendered = []
+    all_generation_indices = []
+
+    for chat in conversations:
+        # TODO
+        if add_system_message:
+            DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
+            chat = [{"role": "system", "content": DEFAULT_SYSTEM_MESSAGE}] + chat
+
+        if return_assistant_tokens_mask:
+            rendered_chat, generation_indices = _render_with_assistant_indices(
+                compiled_template=compiled_template,
+                messages=chat,
+                tools=None,
+                documents=None,
+                add_generation_prompt=add_generation_prompt,
+                **tokenizer.special_tokens_map,
             )
-
-        if return_assistant_tokens_mask and not return_dict:
-            raise ValueError("`return_assistant_tokens_mask=True` is incompatible with `return_dict=False`")
-
-        if tokenizer_kwargs is None:
-            tokenizer_kwargs = {}
-
-        # chat_template = self.get_chat_template(chat_template, tools)
-        # Compilation function uses a cache to avoid recompiling the same template
-        if isinstance(chat_template, list):
-            chat_template = "".join([t["template"] for t in chat_template])
-
-        if return_assistant_tokens_mask and not re.search(r"\{\%-?\s*generation\s*-?\%\}", chat_template):
-            # logger.warning_once(
-            print(
-                "return_assistant_tokens_mask==True but chat template does not contain `{% generation %}` keyword."
-            )
-
-        compiled_template = _compile_jinja_template(chat_template)
-
-        if isinstance(conversation, (list, tuple)) and (
-            isinstance(conversation[0], (list, tuple)) or hasattr(conversation[0], "messages")
-        ):
-            conversations = conversation
-            is_batched = True
+            all_generation_indices.append(generation_indices)
         else:
-            conversations = [conversation]
-            is_batched = False
+            rendered_chat = compiled_template.render(
+                messages=chat,
+                tools=None,
+                documents=None,
+                add_generation_prompt=add_generation_prompt,
+                **tokenizer.special_tokens_map,
+            )
+        rendered.append(rendered_chat)
 
-        if continue_final_message:
-            if add_generation_prompt:
-                raise ValueError(
-                    "continue_final_message and add_generation_prompt are not compatible. Use continue_final_message when you want the model to continue the final message, and add_generation_prompt when you want to add a header that will prompt it to start a new assistant message instead."
-                )
-            if return_assistant_tokens_mask:
-                raise ValueError("continue_final_message is not compatible with return_assistant_tokens_mask.")
+    if not is_batched:
+        rendered = rendered[0]
 
-        tool_schemas = None
-        documents = None
+    if not tokenize:
+        return rendered
 
-        rendered = []
-        all_generation_indices = []
-        template_kwargs = {**base_tokenizer.special_tokens_map, **kwargs}  # kwargs overwrite special tokens if both are present
+    out = tokenizer(
+        rendered,
+        padding=padding,
+        truncation=truncation,
+        max_length=max_length,
+        add_special_tokens=False,
+        return_tensors=return_tensors,
+        **tokenizer_kwargs,
+    )
 
-        for chat in conversations:
-            if hasattr(chat, "messages"):
-                # Indicates it's a Conversation object
-                chat = chat.messages
-            if return_assistant_tokens_mask:
-                rendered_chat, generation_indices = _render_with_assistant_indices(
-                    compiled_template=compiled_template,
-                    messages=chat,
-                    tools=tool_schemas,
-                    documents=documents,
-                    add_generation_prompt=add_generation_prompt,
-                    **template_kwargs,
-                )
-                all_generation_indices.append(generation_indices)
-            else:
-                rendered_chat = compiled_template.render(
-                    messages=chat,
-                    tools=tool_schemas,
-                    documents=documents,
-                    add_generation_prompt=add_generation_prompt,
-                    **template_kwargs,
-                )
-            if continue_final_message:
-                final_message = chat[-1]["content"]
-                if isinstance(final_message, (list, tuple)):
-                    final_message = final_message[-1]["text"]
-                try:
-                    rendered_chat = rendered_chat[: rendered_chat.rindex(final_message) + len(final_message)]
-                except:  # noqa: E722
-                    # Some chat templates like Llama-3.1 trim messages before rendering, so we must do the same here.
-                    final_message = final_message.strip()
-                    rendered_chat = rendered_chat[: rendered_chat.rindex(final_message) + len(final_message)]
-            rendered.append(rendered_chat)
-
-        if not is_batched:
-            rendered = rendered[0]
-
-        texts = []
-        input_ids = []
-        attention_mask = []
-        labels = []
+    if return_assistant_tokens_mask:
         assistant_masks = []
+        input_ids = out["input_ids"] if is_batched or return_tensors else [out["input_ids"]]
 
-        if tokenize:
-            for i in range(len(rendered)):
-                # only one generation index per conversation
-                base_text = rendered[i][:all_generation_indices[i][0][0]]
-                generated_text = rendered[i][all_generation_indices[i][0][0]:all_generation_indices[i][0][1]]
-                rest_of_text = rendered[i][all_generation_indices[i][0][1]:]
-
-                out_base = base_tokenizer(
-                    base_text,
-                    add_special_tokens=False,
-                    return_tensors=return_tensors,
-                    **tokenizer_kwargs,
-                )
-                out_generated = second_tokenizer(
-                    generated_text,
-                    add_special_tokens=False,
-                    return_tensors=return_tensors,
-                    **tokenizer_kwargs,
-                )
-                out_rest = base_tokenizer(
-                    rest_of_text,
-                    add_special_tokens=False,
-                    return_tensors=return_tensors,
-                    **tokenizer_kwargs,
-                )
-                # TODO return batch encoding instead of dict
-                
-                texts.append(rendered[i])
-                input_ids.append(out_base["input_ids"] + out_generated["input_ids"] + out_rest["input_ids"])
-                attention_mask.append(out_base["attention_mask"] + out_generated["attention_mask"] + out_rest["attention_mask"])
-                assistant_masks.append([0] * len(out_base["input_ids"]) + [1] * len(out_generated["input_ids"]) + [0] * len(out_rest["input_ids"]))
-                labels.append(input_ids[-1].copy())
-
-            return {"text": texts, "input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "loss_mask": assistant_masks}
+        if all(len(spans) == 0 for spans in all_generation_indices):
+            assistant_masks = build_loss_mask_from_roles(
+                input_ids_list=input_ids,
+                tokenized_texts=rendered,
+                conversation_batches=conversations,
+                tokenizer=tokenizer,
+            )
         else:
-            return {"text": rendered}
+            for i, gen_spans in enumerate(all_generation_indices):
+                current_mask = [0] * len(input_ids[i])
+                for start_char, end_char in gen_spans:
+                    start_token = out.char_to_token(i, start_char)
+                    end_token = out.char_to_token(i, end_char - 1)
+                    if start_token is None or end_token is None:
+                        continue
+                    for token_idx in range(start_token, end_token + 1):
+                        current_mask[token_idx] = 1
+                assistant_masks.append(current_mask)
+
+        if not is_batched and not return_tensors:
+            assistant_masks = assistant_masks[0]
+
+        out["loss_mask"] = assistant_masks
+
+    return out
+
+def convert_to_repeat_chat(chat: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Convert a chat to a repeat chat.
+    """
+    assert len(chat) == 2, f"Chat must have exactly 2 messages, got {len(chat)}"
+    assert chat[0]["role"] == "user", f"First message must be a user message, got {chat[0]['role']}"
+    assert chat[1]["role"] == "assistant", f"Second message must be an assistant message, got {chat[1]['role']}"
+    sentence = f"Question: {chat[0]['content']} Answer: {chat[1]['content']}"
+    return [{"role": "user", "content": sentence}, {"role": "assistant", "content": sentence}]
+
+def apply_chat_template_repeat(
+    base_tokenizer: AutoTokenizer,
+    second_tokenizer: AutoTokenizer,
+    conversation: Union[List[Dict[str, str]], List[List[Dict[str, str]]]],
+    chat_template: Optional[str] = None,
+    add_generation_prompt: bool = False,
+    return_tensors: Optional[Union[str, TensorType]] = None,
+    tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Special repeat-task templating (two-tokenizer case), supports batching.
+    """
+    if tokenizer_kwargs is None:
+        tokenizer_kwargs = {}
+
+    if chat_template is None:
+        chat_template = get_llama32_repeat_chat_template()
+
+    compiled_template = _compile_jinja_template(chat_template)
+
+    if isinstance(conversation, (list, tuple)) and isinstance(conversation[0], dict):
+        conversations = [conversation]
+        is_batched = False
+    else:
+        conversations = conversation
+        is_batched = True
+
+    input_ids_list = []
+    attention_mask_list = []
+    labels_list = []
+    loss_mask_list = []
+    texts = []
+
+    for chat in conversations:
+        chat_repeated = convert_to_repeat_chat(chat)
+        rendered_chat, generation_indices = _render_with_assistant_indices(
+            compiled_template=compiled_template,
+            messages=chat_repeated,
+            tools=None,
+            documents=None,
+            add_generation_prompt=add_generation_prompt,
+            **base_tokenizer.special_tokens_map,
+        )
+
+        gen_start, gen_end = generation_indices[0]
+
+        base_text = rendered_chat[:gen_start]
+        generated_text = rendered_chat[gen_start:gen_end]
+        rest_text = rendered_chat[gen_end:]
+
+        out_base = base_tokenizer(base_text, add_special_tokens=False, return_tensors=return_tensors, **tokenizer_kwargs)
+        out_generated = second_tokenizer(generated_text, add_special_tokens=False, return_tensors=return_tensors, **tokenizer_kwargs)
+        out_rest = base_tokenizer(rest_text, add_special_tokens=False, return_tensors=return_tensors, **tokenizer_kwargs)
+
+        # Concatenate input_ids and attention_mask
+        input_ids = out_base["input_ids"]
+        attention_mask = out_base["attention_mask"]
+        if hasattr(input_ids, "size") and len(input_ids.shape) == 2:
+            # torch or numpy
+            input_ids = input_ids[0]
+            attention_mask = attention_mask[0]
+        input_ids = list(input_ids) + list(out_generated["input_ids"][0]) + list(out_rest["input_ids"][0])
+        attention_mask = list(attention_mask) + list(out_generated["attention_mask"][0]) + list(out_rest["attention_mask"][0])
+        labels = input_ids.copy()
+        loss_mask = (
+            [0] * out_base["input_ids"].shape[-1] +
+            [1] * out_generated["input_ids"].shape[-1] +
+            [0] * out_rest["input_ids"].shape[-1]
+        )
+
+        input_ids_list.append(input_ids)
+        attention_mask_list.append(attention_mask)
+        labels_list.append(labels)
+        loss_mask_list.append(loss_mask)
+        texts.append(rendered_chat)
+
+    if return_tensors == "pt":
+        import torch
+        input_ids_list = torch.nn.utils.rnn.pad_sequence([torch.tensor(ids) for ids in input_ids_list], batch_first=True, padding_value=base_tokenizer.pad_token_id)
+        attention_mask_list = torch.nn.utils.rnn.pad_sequence([torch.tensor(mask) for mask in attention_mask_list], batch_first=True, padding_value=0)
+        labels_list = torch.nn.utils.rnn.pad_sequence([torch.tensor(lbls) for lbls in labels_list], batch_first=True, padding_value=-100)
+        loss_mask_list = torch.nn.utils.rnn.pad_sequence([torch.tensor(mask) for mask in loss_mask_list], batch_first=True, padding_value=0)
+
+    return {
+        "input_ids": input_ids_list,
+        "attention_mask": attention_mask_list,
+        "labels": labels_list,
+        "loss_mask": loss_mask_list,
+        "text": texts,
+    }
+
+def build_loss_mask_from_roles(
+    input_ids_list,
+    tokenized_texts: List[str],
+    conversation_batches: List[List[Dict[str, str]]],
+    tokenizer: AutoTokenizer,
+) -> List[List[int]]:
+    """
+    Build a loss mask manually, assuming:
+    - input_ids_list: tokenized input IDs (after rendering full conversation)
+    - tokenized_texts: rendered texts (str) matching input_ids
+    - conversation_batches: original conversations (list of messages with roles)
+    - tokenizer: the tokenizer used
+    Returns:
+        loss_masks: list of loss masks (1 = assistant response token, 0 = others)
+    """
+    assistant_masks = []
+
+    for input_ids, rendered_text, conversation in zip(input_ids_list, tokenized_texts, conversation_batches):
+        tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
+        mask = [0] * len(tokens)
+
+        rendered_cursor = 0
+        for msg in conversation:
+            role = msg["role"]
+            content = msg["content"]
+
+            # Find the rendered position of this message's content
+            idx = rendered_text.find(content, rendered_cursor)
+            if idx == -1:
+                raise ValueError(f"Could not find message content '{content}' in rendered text!")
+
+            rendered_cursor = idx + len(content)
+
+            if role == "assistant":
+                # Token-wise: mark tokens corresponding to this span
+                # Decode tokens sequentially and match character spans
+                current_char_pos = 0
+                for token_idx, token in enumerate(tokens):
+                    decoded_piece = tokenizer.convert_tokens_to_string([token])
+                    piece_len = len(decoded_piece)
+
+                    if idx <= current_char_pos < idx + len(content):
+                        mask[token_idx] = 1
+                    current_char_pos += piece_len
+
+        assistant_masks.append(mask)
+
+    return assistant_masks
+
+def visualize_loss_mask(input_ids, loss_mask, tokenizer):
+    """
+    Visualize the loss-masked parts of a tokenized sample with color highlighting and show token IDs.
+
+    Args:
+        input_ids (List[int] or Tensor): tokenized input ids
+        loss_mask (List[int]): mask where 1 = assistant tokens to supervise
+        tokenizer (AutoTokenizer): tokenizer for decoding
+    Returns:
+        str: visualization string
+    """
+    tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
+    output = []
+    for token, token_id, mask in zip(tokens, input_ids, loss_mask):
+        token_text = f"{token}"
+        if token_id > 128000:
+            token_id_text = f"\033[1;31m({token_id})\033[0m"  # White color otherwise
+        else:
+            token_id_text = f"\033[1;37m({token_id})\033[0m"  # Red color if ID > 128000
+        if mask:
+            # Highlight masked tokens (green background + black text)
+            output.append(f"\033[1;30;42m {token_text} \033[0m{token_id_text}")
+        else:
+            output.append(f"{token_text}{token_id_text}")
+    return " ".join(output)
 
 
 if __name__ == "__main__":
-    base_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-    second_tokenizer = AutoTokenizer.from_pretrained("tokenizers/Llama-3.2-tokenizer-genqa-math-empty-start-1000")
-    
-    # Format the conversation as a list of messages
-    conversation = [
-        [{
-            "role": "user",
-            "content": "Hello, how are you?"
-        }],
-        [{
-            "role": "user",
-            "content": "CONVO 2"
-        }]
+    from transformers import AutoTokenizer
+
+    # Load tokenizers
+    base_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+    second_tokenizer = AutoTokenizer.from_pretrained("tokenizers/Llama-3.2-tokenizer-magpie_pro_300k_filtered-math-empty-start-1000")
+
+    if base_tokenizer.pad_token is None:
+        base_tokenizer.pad_token = base_tokenizer.eos_token
+
+    if second_tokenizer.pad_token is None:
+        second_tokenizer.pad_token = second_tokenizer.eos_token
+        
+    # Sample conversations
+    normal_conversations = [
+        [
+            {"role": "user", "content": "What's 2 + 2?"},
+            {"role": "assistant", "content": "4"}
+        ],
+        [
+            {"role": "user", "content": "Tell me a joke."},
+            {"role": "assistant", "content": "Why did the chicken cross the road?"}
+        ],
+        [
+            { 
+                "role": "user", 
+                "content": "Can you explain the concept of equitable distribution in family law?" 
+            }, 
+            { 
+                "role": "assistant", 
+                "content": "In family law, equitable distribution refers to the process of dividing marital assets and debts fairly and reasonably between spouses in the event of a divorce or separation. The goal of equitable distribution is to allocate the marital estate in a way that is just and equitable, considering the unique circumstances of each case.\n\nHere are some key principles and concepts related to equitable distribution:\n\n1. **Marital Property**: Marital property includes all assets and debts acquired during the marriage, regardless of whose name they are in. This can include real estate, bank accounts, investments, retirement accounts, vehicles, and personal property.\n2. **Separate Property**: Separate property, on the other hand, refers to assets and debts acquired before the marriage, inherited, or gifted to one spouse individually. These assets are typically not subject to equitable distribution.\n3. **Equitable Does Not Mean Equal**: While the term \"equitable\" might suggest a 50/50 split, that's not always the case. The court's goal is to divide the marital estate fairly, considering various factors, which may result in an unequal distribution.\n4. **Factors Considered**: Courts consider several factors when determining an equitable distribution, including:\n\t* The length of the marriage\n\t* The income and earning capacity of each spouse\n\t* The age and health of each spouse\n\t* The contributions of each spouse to the acquisition of marital assets\n\t* The value of each spouse's separate property\n\t* The tax implications of the distribution\n\t* The needs of each spouse, including their financial situation and living arrangements\n5. **Types of Distribution**: There are two main types of distribution:\n\t* **In-Kind Distribution**: Assets are divided in their current form, such as one spouse keeping the family home and the other spouse keeping a retirement account.\n\t* **Monetary Distribution**: Assets are sold or liquidated, and the proceeds are divided between the spouses.\n6. **Debt Distribution**: Marital debts, such as credit card debt, mortgages, and loans, are also subject to equitable distribution. The court will consider which spouse is more responsible for the debt and allocate it accordingly.\n7. **Valuation**: The value of marital assets and debts must be determined to facilitate an equitable distribution. This may involve appraisals, expert testimony, or other methods to establish the value of complex assets, such as businesses or investments.\n8. **Negotiation and Mediation**: Spouses can negotiate an equitable distribution agreement through mediation or collaborative law, which can help avoid costly and time-consuming litigation.\n9. **Court Intervention**: If an agreement cannot be reached, the court will intervene and make a determination on the equitable distribution of the marital estate.\n\nIn summary, equitable distribution is a complex process that aims to divide marital assets and debts fairly and reasonably between spouses in the event of a divorce or separation. The court considers various factors to ensure a just and equitable outcome, which may not always result in an equal split." 
+            }
+        ]
     ]
-    
-    chat_template = get_llama_base_chat_template()
-    
-    result = apply_chat_template_to_repeat(
+
+    repeat_conversation = [
+        # [
+        #     # {"role": "user", "content": "Repeat this question and answer exactly: What is 5+5? 10."},
+        # ],
+        [
+            { 
+                "role": "user", 
+                "content": "Can you explain the concept of equitable distribution in family law?" 
+            }, 
+            { 
+                "role": "assistant", 
+                "content": "In family law, equitable distribution refers to the process of dividing marital assets and debts fairly and reasonably between spouses in the event of a divorce or separation. The goal of equitable distribution is to allocate the marital estate in a way that is just and equitable, considering the unique circumstances of each case.\n\nHere are some key principles and concepts related to equitable distribution:\n\n1. **Marital Property**: Marital property includes all assets and debts acquired during the marriage, regardless of whose name they are in. This can include real estate, bank accounts, investments, retirement accounts, vehicles, and personal property.\n2. **Separate Property**: Separate property, on the other hand, refers to assets and debts acquired before the marriage, inherited, or gifted to one spouse individually. These assets are typically not subject to equitable distribution.\n3. **Equitable Does Not Mean Equal**: While the term \"equitable\" might suggest a 50/50 split, that's not always the case. The court's goal is to divide the marital estate fairly, considering various factors, which may result in an unequal distribution.\n4. **Factors Considered**: Courts consider several factors when determining an equitable distribution, including:\n\t* The length of the marriage\n\t* The income and earning capacity of each spouse\n\t* The age and health of each spouse\n\t* The contributions of each spouse to the acquisition of marital assets\n\t* The value of each spouse's separate property\n\t* The tax implications of the distribution\n\t* The needs of each spouse, including their financial situation and living arrangements\n5. **Types of Distribution**: There are two main types of distribution:\n\t* **In-Kind Distribution**: Assets are divided in their current form, such as one spouse keeping the family home and the other spouse keeping a retirement account.\n\t* **Monetary Distribution**: Assets are sold or liquidated, and the proceeds are divided between the spouses.\n6. **Debt Distribution**: Marital debts, such as credit card debt, mortgages, and loans, are also subject to equitable distribution. The court will consider which spouse is more responsible for the debt and allocate it accordingly.\n7. **Valuation**: The value of marital assets and debts must be determined to facilitate an equitable distribution. This may involve appraisals, expert testimony, or other methods to establish the value of complex assets, such as businesses or investments.\n8. **Negotiation and Mediation**: Spouses can negotiate an equitable distribution agreement through mediation or collaborative law, which can help avoid costly and time-consuming litigation.\n9. **Court Intervention**: If an agreement cannot be reached, the court will intervene and make a determination on the equitable distribution of the marital estate.\n\nIn summary, equitable distribution is a complex process that aims to divide marital assets and debts fairly and reasonably between spouses in the event of a divorce or separation. The court considers various factors to ensure a just and equitable outcome, which may not always result in an equal split." 
+            }
+        ]
+    ]
+
+    # --- NORMAL TEMPLATE EXAMPLE ---
+    print("\n=== NORMAL INSTRUCTION TEMPLATE ===")
+    normal_result = apply_chat_template_normal(
+        tokenizer=second_tokenizer,
+        conversation=normal_conversations,
+        add_generation_prompt=False,
+        return_assistant_tokens_mask=True,
+        return_tensors="pt",
+        padding="longest",
+        truncation=True,
+    )
+
+    print("Keys:", normal_result.keys())
+    print("Input IDs shape:", normal_result["input_ids"].shape)
+    print("Loss mask shape:", len(normal_result["loss_mask"]))
+    print("Sample text (detokenized):")
+    print("\n=== NORMAL TASK LOSS MASK VISUALIZATION ===")
+    for i in range(len(normal_result["input_ids"])):    
+        print(second_tokenizer.batch_decode(normal_result["input_ids"][i], skip_special_tokens=False))
+        viz = visualize_loss_mask(
+            input_ids=normal_result["input_ids"][i],
+            loss_mask=normal_result["loss_mask"][i],
+            tokenizer=second_tokenizer,
+        )
+        print(viz)
+        print("\n")
+
+    # --- REPEAT TEMPLATE EXAMPLE ---
+    print("\n=== SPECIAL REPEAT TASK TEMPLATE ===")
+    repeat_result = apply_chat_template_repeat(
         base_tokenizer=base_tokenizer,
         second_tokenizer=second_tokenizer,
-        conversation=conversation,
-        chat_template=chat_template,
-        return_assistant_tokens_mask=True,
-        add_generation_prompt=True,
-        return_dict=True,
+        conversation=repeat_conversation,
+        chat_template=get_llama32_repeat_chat_template(),
+        add_generation_prompt=False,
+        return_tensors="pt",
+        # padding="longest",
+        # truncation=True,
     )
-    
-    print("Result:", result)
+
+    print("Keys:", repeat_result.keys())
+    print("Input IDs length:", len(repeat_result["input_ids"]))
+    print("Loss mask length:", len(repeat_result["loss_mask"]))
+    print("Sample text (detokenized):")
+    print("\n=== REPEAT TASK LOSS MASK VISUALIZATION ===")
+    for i in range(len(repeat_result["input_ids"])):
+        print(second_tokenizer.batch_decode(repeat_result["input_ids"][i], skip_special_tokens=False))
+        viz = visualize_loss_mask(
+            input_ids=repeat_result["input_ids"][i],
+            loss_mask=repeat_result["loss_mask"][i],
+            tokenizer=second_tokenizer,
+        )
+        print(viz)
+        print("\n")

@@ -2,6 +2,9 @@ import torch
 import json
 from transformers import LlamaForCausalLM
 
+# TODO see class IdeficsDecoupledEmbedding(nn.Embedding):
+
+
 def get_new_embedding_params(model, num_new_tokens: int):
     """Return a list of parameters corresponding to the new token embeddings.
     Important note: this will not return the grads, only the params.
@@ -48,6 +51,21 @@ def get_new_embeddings_grads(model, num_new_tokens: int):
 
     # Return as list of parameters
     return [grad_slice_input, grad_slice_output]
+
+
+def get_old_embedding_params(model, num_new_tokens: int):
+    """Return a list of parameters corresponding to the new token embeddings.
+    Important note: this will not return the grads, only the params.
+    """
+    
+    new_embedding_params = []
+
+    for name, param in model.named_parameters():
+        if "embed_tokens.weight" in name or "lm_head.weight" in name:  # Track input/output embeddings
+            vocab_size = param.shape[0]  # First dimension is vocab size
+            new_embedding_params.append(param[:vocab_size - num_new_tokens])  # Slice only old tokens
+
+    return new_embedding_params  # Returns a list of tensors
 
 def get_old_embeddings_grads(model, num_new_tokens: int):
     """
