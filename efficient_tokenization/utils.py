@@ -195,7 +195,7 @@ def parse_args():
                       default="SFT",
                       help="Whether to finetune the model parameters")
     args.add_argument("--unfreeze-params-steps", type=int,
-                    default=-1,
+                    default=0,
                     help="Steps to switch to finetuning params")
     args.add_argument("--finetune-params", type=str,
                       choices=["full", "embeddings", "new_tokens_only", "lora", "first_last"],

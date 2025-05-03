@@ -413,7 +413,7 @@ def main(args):
     main_loss_type = args.main_loss # 7. main_loss
     num_new_tokens = args.num_new_tokens # 8. num_new_tokens
     # prefreeze params
-    if args.unfreeze_params_steps is None or args.unfreeze_params_steps <= 0 or args.finetune_params_prefreeze == args.finetune_params:
+    if args.unfreeze_params_steps is None or args.unfreeze_params_steps < 0 or args.finetune_params_prefreeze == args.finetune_params:
         logger.info(f"Unfreezing params after unfreeze step is not set or is the same as finetune params after unfreeze, so we will not unfreeze params")
         finetune_params_prefreeze = None
         reset_optimizer = False
