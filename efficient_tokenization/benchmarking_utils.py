@@ -4,11 +4,12 @@ import sys
 from efficient_tokenization.utils import generate_hashed_dir_name, parse_args
 from efficient_tokenization.model_utils import calc_batch_size_stuff
 
-def compile_eval_scripts(all_output_paths: List[str], output_bash_file: str):
+def compile_eval_scripts(all_output_paths: List[str], output_bash_file: str, title: str = ""):
     eval_scripts = []
     missing_list = []
 
     with open(output_bash_file, "a") as bash_file:
+        bash_file.write(f"{title}\n")
         for subdir_path in all_output_paths:
 
         # for subdir in os.listdir(base_dir):
@@ -94,6 +95,7 @@ def parse_args_from_file(file_path : str):
 
 def convert_argparse_to_values(args, num_processes: int = 1):
     ##### BATCH SIZE STUFF #####
+       ###### BATCH SIZE STUFF ######
     # logger.info(f"Setting batch size and gradient accumulation steps...")
     total_batch_size, batch_size, gradient_accumulation_steps = calc_batch_size_stuff(total_batch_size = args.total_batch_size, 
                                                                                       batch_size = args.batch_size, 
@@ -116,6 +118,7 @@ def convert_argparse_to_values(args, num_processes: int = 1):
     num_new_tokens = args.num_new_tokens # 8. num_new_tokens
     # prefreeze params
     if args.unfreeze_params_steps is None or args.unfreeze_params_steps <= 0 or args.finetune_params_prefreeze == args.finetune_params:
+        # logger.info(f"Unfreezing params after unfreeze step is not set or is the same as finetune params after unfreeze, so we will not unfreeze params")
         finetune_params_prefreeze = None
         reset_optimizer = False
         unfreeze_params_steps = -1
@@ -237,6 +240,7 @@ def add_baseline_lm_eval(file_args_obj, pre_args: Dict):
 
     return get_lm_eval_string(output_dir = model_path, 
                               tokenizer_path = None,
+                              base_tokenizer_path=file_args_obj.original_model,
                               tasks = tasks,
                               num_processes = num_processes,
                               limit = limit,
@@ -262,8 +266,8 @@ def get_lm_eval_string(output_dir: str,
                        ) -> str:
     model_args_str = (f"pretrained={output_dir},tokenizer={tokenizer_path}") if tokenizer_path is not None else f"pretrained={output_dir}"
     extra_config_str = (f"--extra config base_tokenizer={base_tokenizer_path}") if base_tokenizer_path is not None else ""
-    return f"""accelerate launch --num_processes {num_processes} -m lm_eval_new_tokens \
-    --model hf
+    return f"""accelerate launch --num_processes {num_processes} lm_eval_new_tokens \
+    --model hf \
     --model_args {model_args_str} \
     --gen_kwargs do_sample=False,temperature=0.0,top_p=1.0 \
     --tasks {",".join(tasks)} \

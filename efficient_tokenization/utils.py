@@ -219,10 +219,10 @@ def parse_args():
     args.add_argument("--main-loss", type=str,
                       choices=["all", "translated", "new_tokens", None],
                       default=None,
-                      help="Whether to backpropagate on all losses or just some")
+                      help="Which losses to backpropagate on")
     args.add_argument("--train-losses-to-track", type=str,
                       default=None,
-                      help="List of losses to track during training")
+                      help="List of losses to track during training in addition to main loss")
     args.add_argument("--eval-losses-to-track", type=str,
                       default=None,
                       help="List of losses to track during evaluation")
@@ -281,6 +281,8 @@ def parse_args():
     args.add_argument("--do-not-materialize-logits", action="store_true",
                      help="Whether to not materialize logits for additional time savings")
     args.add_argument("--task_list_split", type=str, default=None)
+    args.add_argument("--save-results", type=int, default=0,
+                      help="How many results to save to a file while running benchmarking loop")
 
     args = args.parse_args()
 
@@ -288,35 +290,35 @@ def parse_args():
     args.wandb_tags = args.wandb_tags.split(",") if args.wandb_tags else None
     # loss tracking
 
-    allowed_loss_types = ["all", "translated", "new_tokens"]
+    allowed_loss_types = ["all", "translated", "new_tokens", "mixed"]
     train_losses_to_track = args.train_losses_to_track.split(",") if args.train_losses_to_track else []
     for loss_type in train_losses_to_track:
         if loss_type not in allowed_loss_types:
             raise ValueError(f"Invalid train loss type: {loss_type}")
     args.train_losses_to_track = train_losses_to_track
         
-    eval_losses_to_track = args.eval_losses_to_track.split(",") if args.eval_losses_to_track else ["all"]
+    eval_losses_to_track = args.eval_losses_to_track.split(",") if args.eval_losses_to_track else ["all", "new_tokens", "mixed"]
     for loss_type in eval_losses_to_track:
         if loss_type not in allowed_loss_types:
             raise ValueError(f"Invalid eval loss type: {loss_type}")
         
-    if args.task_name == "translation":
-        if "translated" not in eval_losses_to_track:
-            eval_losses_to_track.append("translated")
-        # if "new_tokens" not in args.eval_losses_to_track:
-        #     eval_losses_to_track.append("new_tokens")
+    # if args.task_name == "translation":
+    #     if "translated" not in eval_losses_to_track:
+    #         eval_losses_to_track.append("translated")
+    #     if "new_tokens" not in args.eval_losses_to_track:
+    #         eval_losses_to_track.append("new_tokens")
     args.eval_losses_to_track = eval_losses_to_track
 
     if args.main_loss == None:
-        args.main_loss = "all"
-        if args.task_name == "SFT":
-            args.main_loss = "all"
-        elif args.task_name == "translation":
-            args.main_loss = "translated"
-        elif args.task_name == "mixed":
-            args.main_loss = "mixed"
-        else:
-            raise ValueError(f"Invalid task name: {args.task_name}")
+        args.main_loss = "mixed"
+        # if args.task_name == "SFT":
+        #     args.main_loss = "all"
+        # elif args.task_name == "translation":
+        #     args.main_loss = "translated"
+        # elif args.task_name == "mixed":
+        #     args.main_loss = "mixed"
+        # else:
+        #     raise ValueError(f"Invalid task name: {args.task_name}")
         
     if args.original_model is None:
         args.original_model = args.model

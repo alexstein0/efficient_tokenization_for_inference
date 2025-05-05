@@ -34,6 +34,7 @@ if __name__ == "__main__":
     file_args_list = []
     pre_args_list = []
     lines = []
+    source_script_name = ""
     if args.train_run_file is None:
         output_run_list = get_all_output_paths(args.base_dir)
     else:
@@ -56,7 +57,7 @@ if __name__ == "__main__":
         with open(output_bash_file, "a") as f:
             f.write(base_line_string + "\n")
 
-    missing_list = compile_eval_scripts(output_run_list, output_bash_file)
+    missing_list = compile_eval_scripts(output_run_list, output_bash_file, title = source_script_name)
 
     with open(output_bash_file, "a") as f:
         for missing_dir in missing_list:

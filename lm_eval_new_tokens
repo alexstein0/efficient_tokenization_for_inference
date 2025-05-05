@@ -28,6 +28,9 @@ def cli_evaluate_with_new_tokens(args: Union[argparse.Namespace, None] = None, e
         parser = setup_parser()
         args = parse_eval_args(parser)
 
+    if extra_config_dict is None:
+        extra_config_dict = {}
+
     if args.wandb_args:
         wandb_logger = WandbLogger(**simple_parse_args_string(args.wandb_args))
 
@@ -135,6 +138,7 @@ def cli_evaluate_with_new_tokens(args: Union[argparse.Namespace, None] = None, e
     request_caching_args = request_caching_arg_to_dict(
         cache_requests=args.cache_requests
     )
+    print(f"args.model_args: {args.model_args}")
 
     results = evaluator.simple_evaluate(
         model=args.model,
@@ -173,9 +177,16 @@ def cli_evaluate_with_new_tokens(args: Union[argparse.Namespace, None] = None, e
             model_args_config[key] = value
 
         tokenizer_name = model_args_config.get("tokenizer", model_args_config.get("pretrained", None))
+        if tokenizer_name is not None:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        else:
+            tokenizer = None
+
         base_tokenizer_name = extra_config_dict.get("base_tokenizer", None)
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        base_tokenizer = AutoTokenizer.from_pretrained(base_tokenizer_name)
+        if base_tokenizer_name is not None:
+            base_tokenizer = AutoTokenizer.from_pretrained(base_tokenizer_name)
+        else:
+            base_tokenizer = None
         
         if tokenizer is not None and tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token

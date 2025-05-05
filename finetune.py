@@ -27,7 +27,7 @@ import glob
 
 import psutil
 from efficient_tokenization.tokenize_simple import get_tokenizer
-from efficient_tokenization.extend_embeddings import extend_model_embeddings, get_new_embeddings_grads, get_old_embeddings_grads, unfreeze_model, freeze_model_except_embeddings, freeze_old_embeddings, unfreeze_embeddings, unfreeze_first_last_layer, get_new_embedding_params, get_old_embedding_params
+from efficient_tokenization.extend_embeddings import extend_model_embeddings, get_new_embeddings_grads, get_old_embeddings_grads, unfreeze_model, freeze_model_except_embeddings, freeze_old_embeddings, unfreeze_first_last_layer, get_old_embedding_params, get_new_embedding_params
 from efficient_tokenization.data_utils import MyPaddingCollator, MyPaddingCollatorWithLossMask, MyPaddingCollatorGeneral, create_memory_efficient_loader, load_mixed_dataset
 from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name, get_cpus, parse_args, get_latest_checkpoint
 from efficient_tokenization.model_utils import forward_pass, move_optimizer_to_cpu, move_optimizer_to_gpu, save_checkpoint, remove_old_checkpoints, calc_batch_size_stuff, setup_lora, calculate_norm, save_training_state_dict
@@ -88,7 +88,7 @@ def get_next_batch(ds_iterator, ds_loader, epoch, epoch_step, skip_iterator=None
         epoch_step = 0
         return batch, ds_iterator, epoch, epoch_step, None
 
-def run_benchmark_loop(accelerator, model, config):
+def run_benchmark_loop(accelerator, model, config: Dict, step_no: str = None):
     """
     Run lm-evaluation-harness math benchmark evaluation
     """
@@ -221,6 +221,13 @@ def run_benchmark_loop(accelerator, model, config):
         output_dict["learning_ratio"] = sum(learning_ratio) / len(learning_ratio)
         output_dict["theoretical_compression_ratio"] = sum(theoretical_compression_ratio) / len(theoretical_compression_ratio)
         output_dict["pct_new_tokens"] = sum(pct_new_tokens) / len(pct_new_tokens)
+        num_results_to_save = config.get("save_results", 0)
+        if num_results_to_save > 0:
+            samples = results["samples"][task_names[0]]
+            save_path = os.path.join("eval_results", config["experiment"], config["save_results_dir"], f"results_step{step_no}.json")
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, "w") as f:
+                json.dump(samples[:min(num_results_to_save, len(samples))], f)
     return output_dict
 
 
@@ -339,12 +346,11 @@ def run_evaluation_loop(model, eval_iterator, eval_loader, accelerator, num_iter
     return losses_dict
 
 
-
-def evaluate(model, eval_iterator, eval_loader, accelerator, eval_config: Dict = None, will_benchmark: bool = True, will_eval: bool = True):
+def evaluate(model, eval_iterator, eval_loader, accelerator, eval_config: Dict = None, will_benchmark: bool = True, will_eval: bool = True, update_step: str = None):
     model.eval()
     results = {}
     if will_benchmark:
-        benchmark_metrics_dict = run_benchmark_loop(accelerator, model, eval_config)
+        benchmark_metrics_dict = run_benchmark_loop(accelerator, model, eval_config, update_step)
         results.update(benchmark_metrics_dict)
         accelerator.wait_for_everyone()
     if will_eval:
@@ -413,7 +419,7 @@ def main(args):
     main_loss_type = args.main_loss # 7. main_loss
     num_new_tokens = args.num_new_tokens # 8. num_new_tokens
     # prefreeze params
-    if args.unfreeze_params_steps is None or args.unfreeze_params_steps < 0 or args.finetune_params_prefreeze == args.finetune_params:
+    if args.unfreeze_params_steps is None or args.unfreeze_params_steps <= 0 or args.finetune_params_prefreeze == args.finetune_params:
         logger.info(f"Unfreezing params after unfreeze step is not set or is the same as finetune params after unfreeze, so we will not unfreeze params")
         finetune_params_prefreeze = None
         reset_optimizer = False
@@ -619,18 +625,13 @@ def main(args):
     logger.info(f"Tokenizer vocab size: {len(tokenizer)}, model vocab size: {original_vocab_size}")
 
     assert num_new_tokens == len(tokenizer) - original_vocab_size, f"tokenizer adding different number than num_new tokens: args: {args.num_new_tokens} != tok: {len(tokenizer) - original_vocab_size}"
-    # num_new_tokens = len(tokenizer) - model.config.vocab_size
     
-    # if args.num_new_tokens > 0:
-    #     assert args.num_new_tokens == num_new_tokens, f"tokenizer adding different number than num_new tokens: args: {args.num_new_tokens} != tok: {num_new_tokens}"
-    # args.num_new_tokens = num_new_tokens
-
     ###### INIT LOSS TRACKING ######
     logger.info(f"Initializing loss tracking...")
-    other_loss_types = args.train_losses_to_track
+    train_other_loss_types = args.train_losses_to_track
     eval_other_loss_types = args.eval_losses_to_track
     try:
-        other_loss_types.remove(main_loss_type)
+        train_other_loss_types.remove(main_loss_type)
     except:
         pass
 
@@ -652,8 +653,14 @@ def main(args):
     else:
         # not extending embeddings
         logger.info(f"Not extending model embeddings")
-        main_loss_type = "all"
-        other_loss_types = []
+        if main_loss_type == "new_tokens":
+            logger.info(f"Setting main loss to all because no new tokens were added")
+            main_loss_type = "all"
+
+        if "new_tokens" in train_other_loss_types:
+            train_other_loss_types.remove("new_tokens")
+        if "new_tokens" in eval_other_loss_types:
+            eval_other_loss_types.remove("new_tokens")
 
     embedding_size_in = model.get_input_embeddings().weight.shape[0]
     embedding_size_out = model.get_output_embeddings().weight.shape[0]
@@ -663,46 +670,53 @@ def main(args):
 
     ###### DATA/TASK STUFF ######
     logger.info(f"Setting up data/task stuff...")
-    if task_name == "SFT":
-        data_collator = MyPaddingCollator(
-            tokenizer=tokenizer,
-            max_length=args.max_length if hasattr(args, 'max_length') else None
-        )
-        if "translated" in other_loss_types:
-            other_loss_types.remove("translated")
+    # if task_name == "SFT":
+    #     data_collator = MyPaddingCollator(
+    #         tokenizer=tokenizer,
+    #         max_length=args.max_length if hasattr(args, 'max_length') else None
+    #     )
+    #     if "translated" in other_loss_types:
+    #         other_loss_types.remove("translated")
 
-        if "translated" in eval_other_loss_types:
-            eval_other_loss_types.remove("translated")
+    #     if "translated" in eval_other_loss_types:
+    #         eval_other_loss_types.remove("translated")
 
-    elif task_name == "translation":
-        data_collator = MyPaddingCollatorWithLossMask(
-            tokenizer=tokenizer,
-            max_length=args.max_length if hasattr(args, 'max_length') else None
-        )
-        if "translated" not in other_loss_types and main_loss_type != "translated":
-            other_loss_types.append("translated")
+    # elif task_name == "translation":
+    #     data_collator = MyPaddingCollatorWithLossMask(
+    #         tokenizer=tokenizer,
+    #         max_length=args.max_length if hasattr(args, 'max_length') else None
+    #     )
+    #     if "translated" not in other_loss_types and main_loss_type != "translated":
+    #         other_loss_types.append("translated")
 
-        if "translated" not in eval_other_loss_types:
-            eval_other_loss_types.append("translated")
+    #     if "translated" not in eval_other_loss_types:
+    #         eval_other_loss_types.append("translated")
 
-    elif task_name == "mixed":
-        data_collator = MyPaddingCollatorGeneral(
-            tokenizer=tokenizer,
-            max_length=args.max_length if hasattr(args, 'max_length') else None
-        )
-        other_loss_types = []
-        if "mixed" not in eval_other_loss_types:
-            eval_other_loss_types.append("mixed")
-        if "new_tokens" not in eval_other_loss_types:
-            eval_other_loss_types.append("new_tokens")
-        if "all" not in eval_other_loss_types:
-            eval_other_loss_types.append("all")
-        # we will select the loss type based on the dataset row
-        # This collator will handle both normal and repeat samples in the same batch.
-    else:
-        raise ValueError(f"Invalid task name: {task_name}")
-    
-    logger.info(f"Task: {task_name}, Primary loss: {main_loss_type}, Train tracked losses: {other_loss_types}, Eval tracked losses: {eval_other_loss_types}")
+    # elif task_name == "mixed":
+    #     data_collator = MyPaddingCollatorGeneral(
+    #         tokenizer=tokenizer,
+    #         max_length=args.max_length if hasattr(args, 'max_length') else None
+    #     )
+    #     other_loss_types = []
+    #     if "mixed" not in eval_other_loss_types:
+    #         eval_other_loss_types.append("mixed")
+    #     if "new_tokens" not in eval_other_loss_types:
+    #         eval_other_loss_types.append("new_tokens")
+    #     if "all" not in eval_other_loss_types:
+    #         eval_other_loss_types.append("all")
+    #     # we will select the loss type based on the dataset row
+    #     # This collator will handle both normal and repeat samples in the same batch.
+    # else:
+    #     raise ValueError(f"Invalid task name: {task_name}")
+
+
+    # we will select the loss type based on the dataset row
+    # This collator will handle both normal and repeat samples in the same batch.    
+    data_collator = MyPaddingCollatorGeneral(
+        tokenizer=tokenizer,
+        max_length=args.max_length if hasattr(args, 'max_length') else None
+    )
+    logger.info(f"Task: {task_name}, Primary loss: {main_loss_type}, Train tracked losses: {train_other_loss_types}, Eval tracked losses: {eval_other_loss_types}")
 
     ###### LOAD DATA ######
     logger.info(f"Loading data from {dataset_str}...")
@@ -751,6 +765,7 @@ def main(args):
     ###### FINETUNING MODES (FREEZING PARAMS) ######
     def manage_model_freezing(model: torch.nn.Module, finetuning_params: str, num_new_tokens: int = None, lora_configs: dict = None):
         # Todo make it so you can unfreeze SOME layers
+        logger.info(f"Managing model freezing... ({finetuning_params})")
         model_is_frozen = False
         if finetuning_params == "full":
             model = unfreeze_model(model)
@@ -787,11 +802,13 @@ def main(args):
         return model, model_is_frozen
     
     if will_unfreeze_params and not model_freezing_change_occured:
+        logger.info(f"using prefreeze params")
         current_freeze_params = finetune_params_prefreeze
         current_warmup_steps = warmup_steps_prefreeze
         current_lr_schedule = lr_schedule_prefreeze
         current_max_train_steps = unfreeze_params_steps
     else:
+        logger.info(f"using after unfreeze params")
         current_freeze_params = finetune_params
         current_warmup_steps = warmup_steps
         current_lr_schedule = lr_schedule
@@ -812,7 +829,7 @@ def main(args):
 
     ###### INIT SCHEDULER ######
     def init_scheduler(optim, max_train_steps, warmup_steps, lr_schedule: str, current_step: int = -1):
-        logger.info(f"Initializing scheduler...")
+        logger.info(f"Initializing scheduler... ({lr_schedule})")
         if lr_schedule == "linear":
             scheduler = get_linear_schedule_with_warmup(
                 optim, 
@@ -1008,6 +1025,8 @@ def main(args):
         "materialize_logits": materialize_logits,
         "eval_iters": args.eval_iters,
         "experiment": args.experiment_name,
+        "save_results": args.save_results,
+        "save_results_dir": hashed_file_name
     }
 
     eval_config["tokenizer"] = tokenizer
@@ -1051,7 +1070,7 @@ def main(args):
     start_time = time.time()
     training_time = 0
     use_progress_bar = True
-    eval_at_start = True
+    eval_at_start = False
     log_step = args.log_step + update_step  # start logging at the step specified by the log_step arg + the step number of the checkpoint
     
     progress_bar = tqdm(
@@ -1078,7 +1097,7 @@ def main(args):
                 logger.debug(f"Memory before running evaluation - Device {accelerator.process_index}: {mem_before:.2f} MB", main_process_only=False)
                 move_optimizer_to_cpu(optim)
                 torch.cuda.empty_cache()
-                results = evaluate(model, eval_iterator, eval_loader, accelerator, eval_config=eval_config, will_benchmark=will_benchmark, will_eval=will_eval)
+                results = evaluate(model, eval_iterator, eval_loader, accelerator, eval_config=eval_config, will_benchmark=will_benchmark, will_eval=will_eval, update_step=update_step)
                 move_optimizer_to_gpu(optim)
                 model.train()
                 torch.cuda.empty_cache()
@@ -1210,7 +1229,7 @@ def main(args):
         # therefore you dont need to only do grad.step() on the main process/sync step because it knows   
         with accelerator.accumulate(model):  # Use accelerator's context manager
             main_loss, tracked_losses, num_items_for_loss, tracked_tokens_per_loss_type = forward_pass(
-                model, batch, loss_with_grad=main_loss_type, losses_without_grad=other_loss_types, materialize_logits=materialize_logits
+                model, batch, loss_with_grad=main_loss_type, losses_without_grad=train_other_loss_types, materialize_logits=materialize_logits
             )
             model.train()
 
@@ -1464,18 +1483,24 @@ def main(args):
             # merge the LoRA weights into the backbone
             unwrapped_model = unwrapped_model.merge_and_unload()  # merges LoRA offsets into the backbone
         
-        if accelerator.is_main_process:
-            save_training_state_dict(output_dir_path, training_state_dict, logger)
-
+        logger.info(f"Saving Final model to {output_dir_path}")
         unwrapped_model.save_pretrained(
             output_dir_path,
             is_main_process=accelerator.is_main_process,
             save_function=accelerator.save,
             # state_dict=state_dict,
         )
+
+        success = True
+        if accelerator.is_main_process:
+            success = save_training_state_dict(output_dir_path, training_state_dict, logger)
+
         if save_checkpoints_type == "model_only":
             if accelerator.is_main_process:
-                remove_old_checkpoints(output_dir, logger, "checkpoints")
+                if not success:
+                    logger.info("Failed to save training state dict, skipping model delete")
+                else:
+                    remove_old_checkpoints(output_dir, logger, "checkpoints")
         else:
             save_checkpoint(accelerator, output_dir, training_state_dict, logger, delete_old_checkpoints=not save_checkpoints_type == "all")
 
@@ -1490,7 +1515,7 @@ def main(args):
     torch.cuda.empty_cache()
     
     # Run final evaluation
-    eval_metrics_dict = evaluate(model, eval_iterator, eval_loader, accelerator, eval_config=eval_config, will_benchmark=eval_config.get("run_lm_eval", True), will_eval=True)
+    eval_metrics_dict = evaluate(model, eval_iterator, eval_loader, accelerator, eval_config=eval_config, will_benchmark=eval_config.get("run_lm_eval", True), will_eval=True, update_step="final")
 
     # move_optimizer_to_gpu(optim)
     if accelerator.is_main_process:
@@ -1509,9 +1534,10 @@ def main(args):
     if accelerator.is_main_process:
         lm_eval_string = get_lm_eval_string(output_dir_path, 
                                             tokenizer.name_or_path, 
+                                            base_tokenizer_path=args.original_model,
                                             tasks=eval_config["benchmark_tasks"],
                                             # num_fewshot=eval_config["num_fewshot"],
-                                            limit=eval_config["limit"],
+                                            # limit=eval_config["limit"],
                                             log_samples=eval_config["log_samples"],
                                             # cache_requests=eval_config["cache_requests"],
                                             # show_config=eval_config["show_config"],

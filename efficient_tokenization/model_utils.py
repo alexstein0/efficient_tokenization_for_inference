@@ -77,13 +77,15 @@ def save_checkpoint(accelerator, output_dir, state_dict, logger, delete_old_chec
     
     accelerator.wait_for_everyone()
 
-def save_training_state_dict(save_location, state_dict, logger):
+def save_training_state_dict(save_location, state_dict, logger) -> bool:
     # Must be main process
     try:
         torch.save(state_dict, os.path.join(save_location, "checkpoint_meta.pt"))
         logger.info(f"Checkpoint metadata saved to {save_location}")
+        return True
     except Exception as e:
         logger.error(f"Error saving checkpoint metadata: {str(e)}")
+        return False
 
 
 def get_checkpoint_paths(checkpoint_dir: str):
@@ -168,6 +170,12 @@ def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor | List[str]], ne
             else:
                 raise ValueError(f"Invalid loss_type: {loss_type}")
             
+            num_tokens_for_loss = (labels.ne(-100)).sum().item()
+            if num_tokens_for_loss == 0:
+                losses[loss_type] = 0.0
+                num_tokens_per_loss_type[loss_type] = 0
+                continue
+
             if materialize_logits:
                 # Calculate the loss using the model's loss function
                 loss = loss_function(logits, labels, vocab_size=model.module.config.vocab_size)
@@ -177,7 +185,7 @@ def calc_loss_without_grad(model, batch: Dict[str, torch.Tensor | List[str]], ne
             
             # Store the loss in the dictionary
             losses[loss_type] = loss.item()
-            num_tokens_per_loss_type[loss_type] = (labels.ne(-100)).sum().item()
+            num_tokens_per_loss_type[loss_type] = num_tokens_for_loss
 
     return losses, num_tokens_per_loss_type
 

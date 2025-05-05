@@ -15,7 +15,7 @@ def get_new_embedding_params(model, num_new_tokens: int):
     for name, param in model.named_parameters():
         if "embed_tokens.weight" in name or "lm_head.weight" in name:  # Track input/output embeddings
             vocab_size = param.shape[0]  # First dimension is vocab size
-            new_embedding_params.append(param[vocab_size - num_new_tokens:])  # Slice only new tokens
+            new_embedding_params.append(param.data[vocab_size - num_new_tokens:])  # Slice only new tokens
 
     return new_embedding_params  # Returns a list of tensors
 
@@ -98,14 +98,14 @@ def get_old_embeddings_grads(model, num_new_tokens: int):
     # Return as list of parameters
     return [grad_slice_input, grad_slice_output]
 
-def calculate_new_embeddings_grad_norm(model, num_new_tokens, norm_type=2.0):
-    """Calculate the gradient norm of the new embeddings."""
-    base_vocab_size = model.config.vocab_size - num_new_tokens
-    input_grad = model.get_input_embeddings().weight.grad[base_vocab_size:]
-    output_grad = model.get_output_embeddings().weight.grad[base_vocab_size:]
-    input_norm = torch.norm(input_grad, p=norm_type)
-    output_norm = torch.norm(output_grad, p=norm_type)
-    return input_norm, output_norm
+# def calculate_new_embeddings_grad_norm(model, num_new_tokens, norm_type=2.0):
+#     """Calculate the gradient norm of the new embeddings."""
+#     base_vocab_size = model.config.vocab_size - num_new_tokens
+#     input_grad = model.get_input_embeddings().weight.grad[base_vocab_size:]
+#     output_grad = model.get_output_embeddings().weight.grad[base_vocab_size:]
+#     input_norm = torch.norm(input_grad, p=norm_type)
+#     output_norm = torch.norm(output_grad, p=norm_type)
+#     return input_norm, output_norm
 
 
 def initialize_new_embeddings(
