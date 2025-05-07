@@ -24,6 +24,10 @@ def crawl_and_load_json_to_df(results_dir = "eval_results", output_dir = "output
         output_dir = os.path.join(output_dir, experiment_dir)
 
     for root, _, files in os.walk(results_dir):
+        # TODO FIX THIS
+        if not (root.startswith(f"{results_dir}/output__") or root.startswith(f"{results_dir}/meta-llama")):
+            print(f"Skipping {root}")
+            continue
         for file in files:
             if file.startswith("results_") and file.endswith(".json"):
                 full_path = os.path.join(root, file)

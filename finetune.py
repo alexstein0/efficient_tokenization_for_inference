@@ -26,19 +26,43 @@ import json
 import glob
 
 import psutil
-from efficient_tokenization.tokenize_simple import get_tokenizer
-from efficient_tokenization.extend_embeddings import extend_model_embeddings, get_new_embeddings_grads, get_old_embeddings_grads, unfreeze_model, freeze_model_except_embeddings, freeze_old_embeddings, unfreeze_first_last_layer, get_old_embedding_params, get_new_embedding_params
-from efficient_tokenization.data_utils import MyPaddingCollator, MyPaddingCollatorWithLossMask, MyPaddingCollatorGeneral, create_memory_efficient_loader, load_mixed_dataset
+# from efficient_tokenization.tokenize_simple import get_tokenizer
+from efficient_tokenization.extend_embeddings import (
+    extend_model_embeddings,
+    get_new_embeddings,
+    get_old_embeddings,
+    unfreeze_model,
+    freeze_model_except_embeddings,
+    freeze_old_embeddings,
+    unfreeze_embeddings,
+    unfreeze_first_last_layer,
+)
+from efficient_tokenization.data_utils import (
+    MyPaddingCollator, 
+    MyPaddingCollatorWithLossMask, 
+    MyPaddingCollatorGeneral, 
+    create_memory_efficient_loader, 
+    load_mixed_dataset
+)
+
 from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name, get_cpus, parse_args, get_latest_checkpoint
-from efficient_tokenization.model_utils import forward_pass, move_optimizer_to_cpu, move_optimizer_to_gpu, save_checkpoint, remove_old_checkpoints, calc_batch_size_stuff, setup_lora, calculate_norm, save_training_state_dict
+from efficient_tokenization.model_utils import (
+    forward_pass, 
+    move_optimizer_to_cpu, 
+    move_optimizer_to_gpu, 
+    save_checkpoint, 
+    remove_old_checkpoints, 
+    calc_batch_size_stuff, 
+    setup_lora, 
+    calculate_norm, 
+    save_training_state_dict
+)
 from efficient_tokenization.benchmarking_utils import get_lm_eval_string, convert_results_into_new_token_metrics
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 
 
 from lm_eval import evaluator, tasks, utils, models
 from lm_eval.tasks import TaskManager
-
-from dataclasses import dataclass
 
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
@@ -224,7 +248,7 @@ def run_benchmark_loop(accelerator, model, config: Dict, step_no: str = None):
         num_results_to_save = config.get("save_results", 0)
         if num_results_to_save > 0:
             samples = results["samples"][task_names[0]]
-            save_path = os.path.join("eval_results", config["experiment"], config["save_results_dir"], f"results_step{step_no}.json")
+            save_path = os.path.join("eval_results", config["experiment"], config["save_results_dir"], f"temp_results_step{step_no}.json")
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             with open(save_path, "w") as f:
                 json.dump(samples[:min(num_results_to_save, len(samples))], f)
@@ -820,8 +844,8 @@ def main(args):
     ###### INIT OPTIMIZER ######
     def init_optimizer(raw_model, lr: float):
         logger.info(f"Initializing optimizer...")
-        optim = torch.optim.AdamW(raw_model.parameters(), lr=lr, fused=True)
-        # optim = torch.optim.AdamW((p for p in raw_model.parameters() if p.requires_grad), lr=lr, fused=True)
+        optim = torch.optim.AdamW(filter(lambda p: p.requires_grad, raw_model.parameters()), lr=lr, fused=True)
+        # optim = torch.optim.AdamW(raw_model.parameters(), lr=lr, fused=True)
         logger.info(f"Initial learning rate from optimizer: {optim.param_groups[0]['lr']}")
         return optim
     
@@ -898,6 +922,7 @@ def main(args):
             mixed_precision="bf16",
             # mixed_precision="fp16",
             kwargs_handlers=[timeout],
+            # step_scheduler_with_optimizer=False,
             project_config=project_config,
             log_with="wandb" if args.wandb else None,
             dataloader_config=dataloader_config
@@ -1070,7 +1095,7 @@ def main(args):
     start_time = time.time()
     training_time = 0
     use_progress_bar = True
-    eval_at_start = False
+    eval_at_start = True
     log_step = args.log_step + update_step  # start logging at the step specified by the log_step arg + the step number of the checkpoint
     
     progress_bar = tqdm(
@@ -1105,6 +1130,10 @@ def main(args):
                 if accelerator.is_main_process:
                     results = {f"eval_{k}": v for k, v in results.items()}
                     results["step"] = update_step
+                    results["log_step"] = log_step
+                    results["epoch"] = epoch
+                    results["epoch_step"] = epoch_step
+                    
                     if args.wandb:
                         wandb.log(results)
                     logger.debug(results)
@@ -1155,6 +1184,7 @@ def main(args):
                 continue_optimizer = False
                 if continue_optimizer:
                     # TODO this doesnt work and im not sure if we should even use it?
+                    # TODO DEPRICATED AS THE MODEL DOES NOT TRACK GRADIENTS FOR LAYERS NOT NEEDED
                     old_lr = optim.param_groups[0]["lr"]
                     optim = release_memory(optim)
                     scheduler = release_memory(scheduler)
@@ -1206,7 +1236,7 @@ def main(args):
             accumulated_tokens_per_loss_type = defaultdict(list)
             model.train()
             start_accumulating = False
-        
+
         batch, training_iterator, epoch, epoch_step, skip_iterator = get_next_batch(training_iterator, train_loader, epoch, epoch_step, skip_iterator)
         i += 1
         total_batched_samples += 1
@@ -1256,21 +1286,17 @@ def main(args):
             
             if accelerator.sync_gradients:
                 if num_new_tokens > 0:
-                    new_embeddings_list = get_new_embedding_params(model, num_new_tokens)
-                    new_embeddings_norm = calculate_norm(new_embeddings_list)
+                    new_embeddings_weights, new_embeddings_grads = get_new_embeddings(model, num_new_tokens)
+                    new_embeddings_norm = calculate_norm(new_embeddings_weights)
+                    new_embeddings_grad_norm = calculate_norm(new_embeddings_grads)
+                    new_embeddings_weights_prestep = new_embeddings_weights[0].cpu()
+                    del new_embeddings_weights, new_embeddings_grads
 
-                    new_embeddings_grad_list = get_new_embeddings_grads(model, num_new_tokens)
-                    new_embeddings_grad_norm = calculate_norm(new_embeddings_grad_list)
-                    
-                    # Also compute norms (not gradients) for new/old embeddings
-                    del new_embeddings_list, new_embeddings_grad_list
-
-                old_embeddings_list = get_old_embedding_params(model, num_new_tokens)
-                old_embeddings_norm = calculate_norm(old_embeddings_list)
-
-                old_embeddings_grad_list = get_old_embeddings_grads(model, num_new_tokens)
-                old_embeddings_grad_norm = calculate_norm(old_embeddings_grad_list)
-                del old_embeddings_list, old_embeddings_grad_list
+                old_embeddings_weights, old_embeddings_grads = get_old_embeddings(model, num_new_tokens)
+                old_embeddings_norm = calculate_norm(old_embeddings_weights)
+                old_embeddings_grad_norm = calculate_norm(old_embeddings_grads)
+                old_embeddings_weights_prestep = old_embeddings_weights[0].cpu()
+                del old_embeddings_weights, old_embeddings_grads
 
                 if args.grad_norm is not None:
                     accelerator.clip_grad_norm_(model.parameters(), args.grad_norm)
@@ -1280,6 +1306,19 @@ def main(args):
                 logger.debug(f"Device {accelerator.process_index} - Step {update_step}, {accumulation_batch_counter}: {scheduler.get_last_lr()}")
                 scheduler.step()
                 
+                if num_new_tokens > 0:
+                    new_embeddings_weights, _ = get_new_embeddings(model, num_new_tokens)
+                    new_embeddings_weights_poststep = new_embeddings_weights[0].cpu()
+                    del new_embeddings_weights
+                    new_embeddings_norm = calculate_norm(new_embeddings_weights_prestep - new_embeddings_weights_poststep)
+                    del new_embeddings_weights_prestep, new_embeddings_weights_poststep
+                    
+                old_embeddings_weights, _ = get_old_embeddings(model, num_new_tokens)
+                old_embeddings_weights_poststep = old_embeddings_weights[0].cpu()
+                del old_embeddings_weights
+                old_embeddings_norm = calculate_norm(old_embeddings_weights_prestep - old_embeddings_weights_poststep)
+                del old_embeddings_weights_prestep, old_embeddings_weights_poststep
+
                 optim.zero_grad()
                 memory_after_grad_step = torch.cuda.memory_allocated() / 1024**2
                 logger.debug(f"Memory after grad step - Device {accelerator.process_index}: {memory_after_grad_step:.2f} MB", main_process_only=False)
@@ -1370,14 +1409,15 @@ def main(args):
                     "grad_norm": grad_norm,
                     "new_embeddings_grad_norm": new_embeddings_grad_norm,
                     "old_embeddings_grad_norm": old_embeddings_grad_norm,
-                    "new_embeddings_norm": new_embeddings_norm,
-                    "old_embeddings_norm": old_embeddings_norm,
+                    "new_embeddings_delta_norm": new_embeddings_norm,
+                    "old_embeddings_delta_norm": old_embeddings_norm,
                     "loop_time": loop_time,
                 }
                 metrics_dict = {f"train_{k}": v for k, v in metrics_dict.items()}
                 metrics_dict["step"] = update_step
                 metrics_dict["log_step"] = log_step
                 metrics_dict["epoch"] = epoch
+                metrics_dict["epoch_step"] = epoch_step
                 metrics_dict["cumulative_training_time"] = training_time
                 loss_log = {k: v for k, v in losses_dict.items() if not k.endswith("_weighted_loss")}
             
@@ -1504,11 +1544,12 @@ def main(args):
         else:
             save_checkpoint(accelerator, output_dir, training_state_dict, logger, delete_old_checkpoints=not save_checkpoints_type == "all")
 
+        del unwrapped_model
+
     # Clear memory before final evaluation
     accelerator.clear()
     torch.cuda.empty_cache()
     gc.collect()
-    del unwrapped_model
 
     # Move optimizer to CPU and clear GPU memory
     move_optimizer_to_cpu(optim)
@@ -1517,13 +1558,15 @@ def main(args):
     # Run final evaluation
     eval_metrics_dict = evaluate(model, eval_iterator, eval_loader, accelerator, eval_config=eval_config, will_benchmark=eval_config.get("run_lm_eval", True), will_eval=True, update_step="final")
 
-    # move_optimizer_to_gpu(optim)
     if accelerator.is_main_process:
         log_dict = {k: v for k, v in eval_metrics_dict.items() if not k.endswith("_weighted_loss")}
-        logger.debug(f"EVAL:Step {update_step}: Eval Loss = {log_dict[f'{main_loss_type}_loss']:.4f}")
+        logger.debug(f"EVAL:Step {update_step}: Eval Loss = {log_dict.get(f'{main_loss_type}_loss', -1):.4f}")
 
         eval_metrics_dict = {f"eval_{k}": v for k, v in eval_metrics_dict.items()}
         eval_metrics_dict["step"] = update_step
+        eval_metrics_dict["log_step"] = log_step
+        eval_metrics_dict["epoch"] = epoch
+        eval_metrics_dict["epoch_step"] = epoch_step
 
         # Use the same dict for both logging and wandb
         if args.wandb:

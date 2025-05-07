@@ -245,6 +245,8 @@ def forward_pass(model,
         # batch["loss_mask"] = batch["loss_mask"].cpu()
         outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=labels, use_cache=False)
         main_loss = outputs.loss
+        # outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False)
+        # main_loss = model.module.loss_function(outputs.logits, labels, vocab_size=model.module.config.vocab_size)
 
     if len(losses_without_grad) > 0:
         tracked_losses, tracked_num_tokens = calc_loss_without_grad(model, batch, new_tokens_mask, losses_without_grad, materialize_logits=materialize_logits)

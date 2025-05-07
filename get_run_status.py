@@ -156,7 +156,7 @@ def parse_log(log_path: str | Path):
     Inspect *log_path* and return:
 
     #   status        : "running" | "queued" | "no_log"
-      progress      : dict or None      ─ latest tqdm‑loss line
+      progress      : dict or None      ─ latest tqdm-loss line
       cancelled     : bool              ─ cancellation ever occurred
       cancel_reason : str | None        ─ reason on last line, if queued
     """
@@ -183,7 +183,7 @@ def parse_log(log_path: str | Path):
     for line in reversed(lines):
         m = GPU_TYPE_RE.search(line)
         if m:
-            out["gpu"] = m.group("gpu")
+            out["gpu"] = m.group("gpu").split()[-1]
             break
 
     if not lines:                       # empty log

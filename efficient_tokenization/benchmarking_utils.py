@@ -9,7 +9,7 @@ def compile_eval_scripts(all_output_paths: List[str], output_bash_file: str, tit
     missing_list = []
 
     with open(output_bash_file, "a") as bash_file:
-        bash_file.write(f"{title}\n")
+        bash_file.write(f"# {title}\n")
         for subdir_path in all_output_paths:
 
         # for subdir in os.listdir(base_dir):
@@ -232,7 +232,8 @@ def add_baseline_lm_eval(file_args_obj, pre_args: Dict):
     tasks = file_args_obj.benchmark_tasks.split(",")
     experiment = file_args_obj.experiment_name
     num_processes = int(pre_args.get("--num_processes", pre_args.get("--num-processes", 1)))
-    limit = int(file_args_obj.limit)
+    # limit = int(file_args_obj.limit)
+    limit = -1
     log_samples = bool(file_args_obj.log_samples)
     # cache_requests = bool(file_args_obj.cache_requests)
     # show_config = bool(file_args_obj.show_config)

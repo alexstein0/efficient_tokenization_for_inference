@@ -5,107 +5,56 @@ from transformers import LlamaForCausalLM
 # TODO see class IdeficsDecoupledEmbedding(nn.Embedding):
 
 
-def get_new_embedding_params(model, num_new_tokens: int):
-    """Return a list of parameters corresponding to the new token embeddings.
-    Important note: this will not return the grads, only the params.
-    """
-    
-    new_embedding_params = []
 
-    for name, param in model.named_parameters():
-        if "embed_tokens.weight" in name or "lm_head.weight" in name:  # Track input/output embeddings
-            vocab_size = param.shape[0]  # First dimension is vocab size
-            new_embedding_params.append(param.data[vocab_size - num_new_tokens:])  # Slice only new tokens
-
-    return new_embedding_params  # Returns a list of tensors
-
-
-def get_new_embeddings_grads(model, num_new_tokens: int):
-    """
-    Get the embeddings for the newly added tokens.
-    
-    Args:
-        model: The model with extended vocabulary
-        num_new_tokens: Number of new tokens that were added
-        
-    Returns:
-        list: List of parameters corresponding to new token embeddings
-    """
-    # Handle distributed models
+def get_new_embeddings(model, num_new_tokens: int):
+    # note, this gets for logging purposes only
+    """Return new token embedding weights and their gradients as (params, grads)."""
     if hasattr(model, 'module'):
         model = model.module
-    
+
     embeddings_output = model.get_output_embeddings()
     embeddings_input = model.get_input_embeddings()
-    
-    # Create indices for the new tokens
+
     vocab_size = model.config.vocab_size
+    input_slice = slice(vocab_size - num_new_tokens, vocab_size)
+    output_slice = slice(vocab_size - num_new_tokens, vocab_size)
+
+    input_weights = embeddings_input.weight[input_slice].clone()
+    output_weights = embeddings_output.weight[output_slice].clone()
 
     with torch.no_grad():
-        grad_slice_output = embeddings_output.weight.grad[vocab_size - num_new_tokens:].clone().detach()
-        grad_slice_input = embeddings_input.weight.grad[vocab_size - num_new_tokens:].clone().detach()
-        # grad_norm = grad_slice.norm()
+        if embeddings_input.weight.grad is not None:
+            input_grads = embeddings_input.weight.grad[input_slice].clone().detach()
+        else:
+            input_grads = None
+        if embeddings_output.weight.grad is not None:
+            output_grads = embeddings_output.weight.grad[output_slice].clone().detach()
+        else:
+            output_grads = None
 
-    # new_embeddings_grad_output = embeddings_output.weight.grad[vocab_size - num_new_tokens:]
-    # new_embeddings_grad_input = embeddings_input.weight.grad[vocab_size - num_new_tokens:]
+    return [input_weights, output_weights], [input_grads, output_grads]
 
-    # Return as list of parameters
-    return [grad_slice_input, grad_slice_output]
-
-
-def get_old_embedding_params(model, num_new_tokens: int):
-    """Return a list of parameters corresponding to the new token embeddings.
-    Important note: this will not return the grads, only the params.
-    """
-    
-    new_embedding_params = []
-
-    for name, param in model.named_parameters():
-        if "embed_tokens.weight" in name or "lm_head.weight" in name:  # Track input/output embeddings
-            vocab_size = param.shape[0]  # First dimension is vocab size
-            new_embedding_params.append(param[:vocab_size - num_new_tokens])  # Slice only old tokens
-
-    return new_embedding_params  # Returns a list of tensors
-
-def get_old_embeddings_grads(model, num_new_tokens: int):
-    """
-    Get the embeddings for the newly added tokens.
-    
-    Args:
-        model: The model with extended vocabulary
-        num_new_tokens: Number of new tokens that were added
-        
-    Returns:
-        list: List of parameters corresponding to new token embeddings
-    """
-    # Handle distributed models
+def get_old_embeddings(model, num_new_tokens: int):
+    # note, this gets for logging purposes only
+    """Return old token embedding weights and their gradients as (params, grads)."""
     if hasattr(model, 'module'):
         model = model.module
-    
+
     embeddings_output = model.get_output_embeddings()
     embeddings_input = model.get_input_embeddings()
-    
-    # Create indices for the new tokens
+
     vocab_size = model.config.vocab_size
+    input_slice = slice(0, vocab_size - num_new_tokens)
+    output_slice = slice(0, vocab_size - num_new_tokens)
+
+    input_weights = embeddings_input.weight[input_slice].clone()
+    output_weights = embeddings_output.weight[output_slice].clone()
 
     with torch.no_grad():
-        grad_slice_output = embeddings_output.weight.grad[:vocab_size - num_new_tokens].clone().detach()
-        grad_slice_input = embeddings_input.weight.grad[:vocab_size - num_new_tokens].clone().detach()
+        input_grads = embeddings_input.weight.grad[input_slice].clone().detach()
+        output_grads = embeddings_output.weight.grad[output_slice].clone().detach()
 
-    # new_embeddings_grad_output = embeddings_output.weight.grad[vocab_size - num_new_tokens:]
-    # new_embeddings_grad_input = embeddings_input.weight.grad[vocab_size - num_new_tokens:]
-
-    # Return as list of parameters
-    return [grad_slice_input, grad_slice_output]
-
-# def calculate_new_embeddings_grad_norm(model, num_new_tokens, norm_type=2.0):
-#     """Calculate the gradient norm of the new embeddings."""
-#     base_vocab_size = model.config.vocab_size - num_new_tokens
-#     input_grad = model.get_input_embeddings().weight.grad[base_vocab_size:]
-#     output_grad = model.get_output_embeddings().weight.grad[base_vocab_size:]
-#     input_norm = torch.norm(input_grad, p=norm_type)
-#     output_norm = torch.norm(output_grad, p=norm_type)
-#     return input_norm, output_norm
+    return [input_weights, output_weights], [input_grads, output_grads]
 
 
 def initialize_new_embeddings(
@@ -237,49 +186,49 @@ def extend_model_embeddings(model, num_new_tokens, init_strategy="default", toke
     
     return model
 
-def my_resize_token_embeddings(model, new_num_tokens, mean_resizing):
-    # TODO dont use this either
-    old_embeddings = model.get_input_embeddings()
-    new_embeddings = model._get_resized_embeddings(
-        old_embeddings, new_num_tokens, pad_to_multiple_of = None, mean_resizing = True
-    )
-    if hasattr(old_embeddings, "_hf_hook"):
-        hook = old_embeddings._hf_hook
-        from accelerate.hooks import add_hook_to_module
-        add_hook_to_module(new_embeddings, hook)
+# def my_resize_token_embeddings(model, new_num_tokens, mean_resizing):
+#     # TODO dont use this either
+#     old_embeddings = model.get_input_embeddings()
+#     new_embeddings = model._get_resized_embeddings(
+#         old_embeddings, new_num_tokens, pad_to_multiple_of = None, mean_resizing = True
+#     )
+#     if hasattr(old_embeddings, "_hf_hook"):
+#         hook = old_embeddings._hf_hook
+#         from accelerate.hooks import add_hook_to_module
+#         add_hook_to_module(new_embeddings, hook)
 
-    old_embeddings_requires_grad = old_embeddings.weight.requires_grad
-    new_embeddings.requires_grad_(old_embeddings_requires_grad)
-    model.set_input_embeddings(new_embeddings)
+#     old_embeddings_requires_grad = old_embeddings.weight.requires_grad
+#     new_embeddings.requires_grad_(old_embeddings_requires_grad)
+#     model.set_input_embeddings(new_embeddings)
 
-    # if word embeddings are not tied, make sure that lm head is resized as well
-    if model.get_output_embeddings() is not None and not model.config.tie_word_embeddings:
-        old_lm_head = model.get_output_embeddings()
-        if isinstance(old_lm_head, torch.nn.Embedding):
-            new_lm_head = model._get_resized_embeddings(old_lm_head, new_num_tokens, mean_resizing=mean_resizing)
-        else:
-            new_lm_head = model._get_resized_lm_head(old_lm_head, new_num_tokens, mean_resizing=mean_resizing)
-        if hasattr(old_lm_head, "_hf_hook"):
-            hook = old_lm_head._hf_hook
-            add_hook_to_module(new_lm_head, hook)
-        old_lm_head_requires_grad = old_lm_head.weight.requires_grad
-        new_lm_head.requires_grad_(old_lm_head_requires_grad)
-        model.set_output_embeddings(new_lm_head)
+#     # if word embeddings are not tied, make sure that lm head is resized as well
+#     if model.get_output_embeddings() is not None and not model.config.tie_word_embeddings:
+#         old_lm_head = model.get_output_embeddings()
+#         if isinstance(old_lm_head, torch.nn.Embedding):
+#             new_lm_head = model._get_resized_embeddings(old_lm_head, new_num_tokens, mean_resizing=mean_resizing)
+#         else:
+#             new_lm_head = model._get_resized_lm_head(old_lm_head, new_num_tokens, mean_resizing=mean_resizing)
+#         if hasattr(old_lm_head, "_hf_hook"):
+#             hook = old_lm_head._hf_hook
+#             add_hook_to_module(new_lm_head, hook)
+#         old_lm_head_requires_grad = old_lm_head.weight.requires_grad
+#         new_lm_head.requires_grad_(old_lm_head_requires_grad)
+#         model.set_output_embeddings(new_lm_head)
 
-    # return self.get_input_embeddings()
-    # model_embeds = model._resize_token_embeddings(new_num_tokens, pad_to_multiple_of, mean_resizing)
-    model_embeds = model.get_input_embeddings()
+#     # return self.get_input_embeddings()
+#     # model_embeds = model._resize_token_embeddings(new_num_tokens, pad_to_multiple_of, mean_resizing)
+#     model_embeds = model.get_input_embeddings()
 
-    vocab_size = model_embeds.weight.shape[0]
+#     vocab_size = model_embeds.weight.shape[0]
 
-    # Update base model and current model config.
-    model.config.get_text_config().vocab_size = vocab_size
-    model.vocab_size = vocab_size
+#     # Update base model and current model config.
+#     model.config.get_text_config().vocab_size = vocab_size
+#     model.vocab_size = vocab_size
 
-    # Tie weights again if needed
-    model.tie_weights()
+#     # Tie weights again if needed
+#     model.tie_weights()
 
-    return model_embeds
+#     return model_embeds
 
 
 def extend_model_embeddings_with_multi_layer(model, num_new_tokens, init_strategy, tokenizer = None):
@@ -433,22 +382,22 @@ def freeze_old_embeddings(model, num_new_tokens):
     model.get_output_embeddings().weight.requires_grad[base_vocab_size:] = True
     return model
 
-def freeze_model_except_embeddings(model, freeze_output_embeddings=True):
+def freeze_model_except_embeddings(model, unfreeze_output_embeddings=True):
     # First freeze all parameters
     for param in model.parameters():
         param.requires_grad = False
     
-    model = unfreeze_embeddings(model, freeze_output_embeddings=freeze_output_embeddings)
+    model = unfreeze_embeddings(model, unfreeze_output_embeddings=unfreeze_output_embeddings)
     
     return model
 
-def unfreeze_embeddings(model, freeze_output_embeddings=True):
+def unfreeze_embeddings(model, unfreeze_output_embeddings=True):
     # Unfreeze input embeddings
     if hasattr(model, 'get_input_embeddings'):
         model.get_input_embeddings().weight.requires_grad = True
     
     # Optionally unfreeze output embeddings if they're not tied
-    if freeze_output_embeddings and hasattr(model, 'get_output_embeddings'):
+    if unfreeze_output_embeddings and hasattr(model, 'get_output_embeddings'):
         output_embeddings = model.get_output_embeddings()
         if output_embeddings is not None:
             output_embeddings.weight.requires_grad = True
