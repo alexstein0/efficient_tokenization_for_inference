@@ -1,7 +1,6 @@
 import torch
 import json
-from transformers import LlamaForCausalLM
-
+import os
 # TODO see class IdeficsDecoupledEmbedding(nn.Embedding):
 
 
@@ -47,12 +46,12 @@ def get_old_embeddings(model, num_new_tokens: int):
     input_slice = slice(0, vocab_size - num_new_tokens)
     output_slice = slice(0, vocab_size - num_new_tokens)
 
-    input_weights = embeddings_input.weight[input_slice].clone()
-    output_weights = embeddings_output.weight[output_slice].clone()
+    input_weights = embeddings_input.weight[input_slice].cpu().clone()
+    output_weights = embeddings_output.weight[output_slice].cpu().clone()
 
     with torch.no_grad():
-        input_grads = embeddings_input.weight.grad[input_slice].clone().detach()
-        output_grads = embeddings_output.weight.grad[output_slice].clone().detach()
+        input_grads = embeddings_input.weight.grad[input_slice].cpu().clone().detach()
+        output_grads = embeddings_output.weight.grad[output_slice].cpu().clone().detach()
 
     return [input_weights, output_weights], [input_grads, output_grads]
 
@@ -61,7 +60,8 @@ def initialize_new_embeddings(
     base_embeddings: torch.Tensor,
     num_new_tokens: int,
     init_strategy: str = "default",
-    tokenizer=None
+    tokenizer=None,
+    import_path=None
 ) -> torch.Tensor:
     """
     Initialize embeddings for new tokens using different strategies.
@@ -138,13 +138,49 @@ def initialize_new_embeddings(
             this_embedding = (first_embedding + second_embedding) / 2
             new_embeddings[i] = this_embedding
 
+    elif init_strategy == "import":
+        if import_path is None:
+            raise ValueError("import_path is required for 'import' initialization strategy")
+
+        from safetensors import safe_open
+
+        # Load all safetensors files from directory or use single file
+        if os.path.isdir(import_path):
+            safetensor_files = sorted(
+                [os.path.join(import_path, f) for f in os.listdir(import_path) if f.endswith(".safetensors")]
+            )
+        else:
+            safetensor_files = [import_path]
+
+        param_dict = {}
+        for file in safetensor_files:
+            with safe_open(file, framework="pt") as f:
+                for key in f.keys():
+                    param_dict[key] = f.get_tensor(key)
+
+        # Try to find embedding weights by common names
+        for key in ["model.embed_tokens.weight", "embed_tokens.weight", "lm_head.weight", "weight"]:
+            if key in param_dict:
+                old_embeddings = param_dict[key]
+                break
+        else:
+            raise ValueError(f"No known embedding key found in safetensors files. Available keys: {list(param_dict.keys())}")
+
+        if old_embeddings.shape[1] != base_embeddings.shape[1]:
+            raise ValueError(f"Imported embeddings have dimension {old_embeddings.shape[1]}, expected {base_embeddings.shape[1]}")
+
+        if old_embeddings.shape[0] < num_new_tokens:
+            raise ValueError(f"Imported embeddings have {old_embeddings.shape[0]} tokens, but {num_new_tokens} new tokens requested")
+
+        # Use last num_new_tokens embeddings
+        new_embeddings = old_embeddings[-num_new_tokens:].clone().to(base_embeddings.device, dtype=base_embeddings.dtype)
     else:
         raise ValueError(f"Unknown initialization strategy: {init_strategy}")
     
     return new_embeddings
 
 
-def extend_model_embeddings(model, num_new_tokens, init_strategy="default", tokenizer=None):
+def extend_model_embeddings(model, num_new_tokens, init_strategy="default", tokenizer=None, import_path=None):
     # 1) Retrieve original embedding weights
     mean_embedding, mean_lm_head = fix_untrained_tokens(model)  # this is from unsloth, might not be needed
 
@@ -155,8 +191,8 @@ def extend_model_embeddings(model, num_new_tokens, init_strategy="default", toke
     lm_head_matrix = model.get_output_embeddings().weight.data
 
     # 2) Prepare new embeddings for input & output
-    new_emb_input = initialize_new_embeddings(embedding_matrix, num_new_tokens, init_strategy, tokenizer)
-    new_emb_output = initialize_new_embeddings(lm_head_matrix, num_new_tokens, init_strategy, tokenizer)
+    new_emb_input = initialize_new_embeddings(embedding_matrix, num_new_tokens, init_strategy, tokenizer, import_path)
+    new_emb_output = initialize_new_embeddings(lm_head_matrix, num_new_tokens, init_strategy, tokenizer, import_path)
 
     # 3) Resize the model to reflect new vocab size
     model.resize_token_embeddings(new_vocab_size)
@@ -186,52 +222,8 @@ def extend_model_embeddings(model, num_new_tokens, init_strategy="default", toke
     
     return model
 
-# def my_resize_token_embeddings(model, new_num_tokens, mean_resizing):
-#     # TODO dont use this either
-#     old_embeddings = model.get_input_embeddings()
-#     new_embeddings = model._get_resized_embeddings(
-#         old_embeddings, new_num_tokens, pad_to_multiple_of = None, mean_resizing = True
-#     )
-#     if hasattr(old_embeddings, "_hf_hook"):
-#         hook = old_embeddings._hf_hook
-#         from accelerate.hooks import add_hook_to_module
-#         add_hook_to_module(new_embeddings, hook)
 
-#     old_embeddings_requires_grad = old_embeddings.weight.requires_grad
-#     new_embeddings.requires_grad_(old_embeddings_requires_grad)
-#     model.set_input_embeddings(new_embeddings)
-
-#     # if word embeddings are not tied, make sure that lm head is resized as well
-#     if model.get_output_embeddings() is not None and not model.config.tie_word_embeddings:
-#         old_lm_head = model.get_output_embeddings()
-#         if isinstance(old_lm_head, torch.nn.Embedding):
-#             new_lm_head = model._get_resized_embeddings(old_lm_head, new_num_tokens, mean_resizing=mean_resizing)
-#         else:
-#             new_lm_head = model._get_resized_lm_head(old_lm_head, new_num_tokens, mean_resizing=mean_resizing)
-#         if hasattr(old_lm_head, "_hf_hook"):
-#             hook = old_lm_head._hf_hook
-#             add_hook_to_module(new_lm_head, hook)
-#         old_lm_head_requires_grad = old_lm_head.weight.requires_grad
-#         new_lm_head.requires_grad_(old_lm_head_requires_grad)
-#         model.set_output_embeddings(new_lm_head)
-
-#     # return self.get_input_embeddings()
-#     # model_embeds = model._resize_token_embeddings(new_num_tokens, pad_to_multiple_of, mean_resizing)
-#     model_embeds = model.get_input_embeddings()
-
-#     vocab_size = model_embeds.weight.shape[0]
-
-#     # Update base model and current model config.
-#     model.config.get_text_config().vocab_size = vocab_size
-#     model.vocab_size = vocab_size
-
-#     # Tie weights again if needed
-#     model.tie_weights()
-
-#     return model_embeds
-
-
-def extend_model_embeddings_with_multi_layer(model, num_new_tokens, init_strategy, tokenizer = None):
+def extend_model_embeddings_with_multi_layer(model, num_new_tokens, init_strategy, tokenizer = None, import_path = None):
     # TODO THIS DOES NOT WORK, PROBABLY EASIER TO DO OTHER WAY
     """Extend model embeddings to match new tokenizer vocabulary."""
     mean_embedding, mean_lm_head = fix_untrained_tokens(model)
@@ -250,7 +242,8 @@ def extend_model_embeddings_with_multi_layer(model, num_new_tokens, init_strateg
         embedding_matrix,
         num_new_tokens,
         init_strategy=init_strategy,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        import_path=import_path
     )
 
     # OUTPUT LAYER
@@ -258,7 +251,8 @@ def extend_model_embeddings_with_multi_layer(model, num_new_tokens, init_strateg
         lm_head_matrix,
         num_new_tokens,
         init_strategy=init_strategy,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        import_path=import_path
     )
 
     # Create new embedding layers
@@ -370,16 +364,28 @@ def fix_untrained_tokens(model, eps = 1e-16):
     return mean_embedding, mean_lm_head
 
 def freeze_old_embeddings(model, num_new_tokens):
-    """Freeze the old embeddings, allowing only the new ones to be trained."""
+    """Freeze the old embeddings by zeroing out their gradients manually during training."""
+    model = freeze_model_except_embeddings(model)
     base_vocab_size = model.config.vocab_size - num_new_tokens
-    for param in model.get_input_embeddings().parameters():
-        param.requires_grad = False
-    for param in model.get_output_embeddings().parameters():
-        param.requires_grad = False
 
-    # Unfreeze the new embeddings
-    model.get_input_embeddings().weight.requires_grad[base_vocab_size:] = True
-    model.get_output_embeddings().weight.requires_grad[base_vocab_size:] = True
+    # Ensure requires_grad = True for the whole embedding matrix
+    for param in model.get_input_embeddings().parameters():
+        param.requires_grad = True
+    for param in model.get_output_embeddings().parameters():
+        param.requires_grad = True
+
+    # Register backward hooks to zero out gradients of the old embeddings
+    def zero_old_grads_input(grad):
+        grad[:base_vocab_size] = 0
+        return grad
+
+    def zero_old_grads_output(grad):
+        grad[:base_vocab_size] = 0
+        return grad
+
+    model.get_input_embeddings().weight.register_hook(zero_old_grads_input)
+    model.get_output_embeddings().weight.register_hook(zero_old_grads_output)
+
     return model
 
 def freeze_model_except_embeddings(model, unfreeze_output_embeddings=True):

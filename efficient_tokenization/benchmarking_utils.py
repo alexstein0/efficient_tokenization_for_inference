@@ -9,7 +9,7 @@ def compile_eval_scripts(all_output_paths: List[str], output_bash_file: str, tit
     missing_list = []
 
     with open(output_bash_file, "a") as bash_file:
-        bash_file.write(f"# {title}\n")
+        bash_file.write(f"\n# {title}\n")
         for subdir_path in all_output_paths:
 
         # for subdir in os.listdir(base_dir):
@@ -249,7 +249,12 @@ def add_baseline_lm_eval(file_args_obj, pre_args: Dict):
                             #   cache_requests = cache_requests,
                             #   show_config = show_config,
                             #   num_fewshot = num_fewshot,
-                              experiment = experiment)
+                              experiment = experiment,
+                              do_sample = file_args_obj.do_sample,
+                              temperature = file_args_obj.temperature,
+                              top_p = file_args_obj.top_p,
+                              top_k = file_args_obj.top_k
+                              )
 
 
 
@@ -264,13 +269,20 @@ def get_lm_eval_string(output_dir: str,
                        show_config: bool = False,
                        num_fewshot: int = -1,
                        experiment: str = None,
+                       do_sample: bool = False,
+                       temperature: float = None,
+                       top_p: float = 1.0,
+                       top_k: int = None,
                        ) -> str:
     model_args_str = (f"pretrained={output_dir},tokenizer={tokenizer_path}") if tokenizer_path is not None else f"pretrained={output_dir}"
-    extra_config_str = (f"--extra config base_tokenizer={base_tokenizer_path}") if base_tokenizer_path is not None else ""
+    extra_config_str = (f"--extra_config base_tokenizer={base_tokenizer_path}") if base_tokenizer_path is not None else ""
+    gen_args = f"do_sample={do_sample},temperature={temperature},top_p={top_p}"
+    if top_k is not None:
+        gen_args += f",top_k={top_k}"
     return f"""accelerate launch --num_processes {num_processes} lm_eval_new_tokens \
     --model hf \
     --model_args {model_args_str} \
-    --gen_kwargs do_sample=False,temperature=0.0,top_p=1.0 \
+    --gen_kwargs {gen_args} \
     --tasks {",".join(tasks)} \
     --batch_size auto \
     --output_path ./eval_results{"" if experiment == None or len(experiment) == 0 else f"/{experiment}"} \

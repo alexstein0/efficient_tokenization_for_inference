@@ -159,6 +159,7 @@ def parse_args():
 
     # implementation params
     args.add_argument("--experiment-name", type=str, default="default")
+    args.add_argument("--use-liger", type=bool, default=True)
     args.add_argument("--extra-info", type=str, default=None)
     args.add_argument("--dry-run", action="store_true")
     args.add_argument("--logging-mode", type=str, choices=["INFO", "DEBUG"], default="INFO")
@@ -257,6 +258,9 @@ def parse_args():
     args.add_argument("--num-new-tokens", type=int,
                       default = 0,
                       help="Number of new tokens to add when extending.  Will check for compatibility with tokenizer.")
+    args.add_argument("--import-path", type=str,
+                      default=None,
+                      help="Path to file containing old embeddings to import.  Will check for compatibility with tokenizer.")
 
 
     # EVAL PARAMS
@@ -283,7 +287,14 @@ def parse_args():
     args.add_argument("--task_list_split", type=str, default=None)
     args.add_argument("--save-results", type=int, default=0,
                       help="How many results to save to a file while running benchmarking loop")
-
+    args.add_argument("--do-sample", action="store_true",
+                      help="Whether to sample from the model", default=False)
+    args.add_argument("--temperature", type=float, default=None,
+                      help="Temperature for sampling")
+    args.add_argument("--top-p", type=float, default=None,
+                      help="Top-p for sampling")
+    args.add_argument("--top-k", type=int, default=None,
+                      help="Top-k for sampling")
     args = args.parse_args()
 
     # some config validation

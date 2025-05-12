@@ -47,7 +47,11 @@ def save_tokenizer_to_huggingface_with_objects(original_tokenizer: PreTrainedTok
     os.makedirs(new_tokenizer_path, exist_ok=True)
 
     if new_added_tokens is not None:
-        original_tokenizer.add_special_tokens({"additional_special_tokens": new_added_tokens})
+        prev_additional_special_tokens = original_tokenizer._special_tokens_map["additional_special_tokens"]
+        additional_special_tokens = []
+        for special_token in new_added_tokens:
+            additional_special_tokens.append(special_token)
+        original_tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
 
     tokenizer_json = json.loads(original_tokenizer._tokenizer.to_str())
     if new_vocab is not None:
@@ -62,7 +66,7 @@ def save_tokenizer_to_huggingface_with_objects(original_tokenizer: PreTrainedTok
     original_tokenizer.save_pretrained(new_tokenizer_path)
     tokenizer_json_path = os.path.join(new_tokenizer_path, "tokenizer.json")
     with open(tokenizer_json_path, "w") as f:
-        json.dump(tokenizer_json, f, indent=2)
+        json.dump(tokenizer_json, f, indent=2, ensure_ascii=False)
 
     # if save_added_tokens is not None:
         

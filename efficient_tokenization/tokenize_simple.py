@@ -8,7 +8,7 @@ from datasets import load_dataset, load_from_disk
 import datasets
 datasets.disable_caching()
 # from chat_templating_old import apply_chat_template_to_repeat, get_llama_base_chat_template, get_llama_instruct_chat_template
-from chat_templating import apply_chat_template_repeat, apply_chat_template_normal, get_llama32_instruct_chat_template, get_llama32_repeat_chat_template
+from chat_templating import apply_chat_template_repeat, apply_chat_template_normal, get_llama32_instruct_chat_template, get_llama32_repeat_chat_template, get_phi_chat_template_repeat, get_phi_cot_chat_template
 import os
 import copy
 
@@ -68,6 +68,23 @@ def extract_magpie(example_list: List[List[List[Dict[str, str]]]], track_role: b
             output.append(out_conversation)
     return output
 
+def extract_gsm8k_cot(example_list: List[List[Dict[str, str]]], track_role: bool = True) -> List[List[str]]:
+    output = []
+    questions = example_list.get('question', [])
+    answers = example_list.get('answer', [])
+    for q, a in zip(questions, answers):
+        out_conversation = []
+        out_message = {}
+        out_message['role'] = "user"
+        out_message['content'] = q.strip()
+        out_conversation.append(out_message)
+        out_message = {}
+        out_message['role'] = "assistant"
+        out_message['content'] = a.strip()
+        out_conversation.append(out_message)
+        output.append(out_conversation)
+    return output
+
 
 def flatten_genqa_conversations(example: Dict[str, List[List[Dict[str, str]]]],
                                 tokenizer: AutoTokenizer = None,
@@ -119,6 +136,28 @@ def flatten_magpie_conversations(example: Dict[str, List[List[Dict[str, str]]]],
         # lengths.extend([len(x) for x in example_text])
         # output['text'] = all_texts
 
+def flatten_gsm8k_cot_conversations(example: Dict[str, List[List[Dict[str, str]]]],
+                                    tokenizer: AutoTokenizer = None,
+                                    track_role: bool = False,
+                                    flattened: bool = False
+                                    ) -> Dict[str, List]:
+    """
+    Extracts and concatenates user and assistant messages, encodes them into bytes.
+    
+    """
+    if flattened:  # already flattened into single text col
+        text_col = example.get('text', [])
+        extracted_texts = text_col
+    else:
+        extracted_texts = extract_gsm8k_cot(example, track_role)
+
+    # TODO
+
+    if tokenizer is not None:
+        all_texts, lengths = tokenize_text_with_pretokenizer(extracted_texts, tokenizer)
+        return {'text': all_texts, 'num_tokens': lengths}
+    else:
+        return {'text': extracted_texts}
 
 def tokenize_text_with_pretokenizer(extracted_texts: List[List[str]],
                                    tokenizer: AutoTokenizer) -> Dict[str, List]:
@@ -350,6 +389,36 @@ def get_magpie_data(ds: datasets.Dataset, tokenizer = None, track_role: bool = F
         )
     return ds
 
+def get_gsm8k_cot_data(ds: datasets.Dataset, tokenizer = None, track_role: bool = False, threads=1, batch_size=1000):
+    fn_kwargs={
+        "tokenizer": tokenizer,
+        "track_role": track_role,
+        "flattened": True,
+        }
+    ds = ds.select_columns("text").map(
+        flatten_gsm8k_cot_conversations,
+        num_proc=threads,
+        batched=True,
+        batch_size=batch_size,
+        fn_kwargs=fn_kwargs,
+        )
+    return ds
+
+def get_gsm8k_data(ds: datasets.Dataset, tokenizer = None, track_role: bool = False, threads=1, batch_size=1000):
+    fn_kwargs={
+        "tokenizer": tokenizer,
+        "track_role": track_role,
+        "flattened": False,
+        }
+    ds = ds.map(
+        flatten_gsm8k_cot_conversations,
+        num_proc=threads,
+        batched=True,
+        batch_size=batch_size,
+        fn_kwargs=fn_kwargs,
+        )
+    return ds
+
 
 def init_tokenizer(tokenizer_path):
     from transformers import AutoTokenizer
@@ -441,8 +510,14 @@ def init_tokenizer(tokenizer_path):
     
 #     return tokenized_dataset
 
-def create_translation_dataset_with_template(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int) -> datasets.Dataset:
-    chat_template = get_llama32_repeat_chat_template()
+def create_translation_dataset_with_template(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int, chat_template_name: str = "llama32") -> datasets.Dataset:
+    if chat_template_name == "llama32":
+        chat_template = get_llama32_repeat_chat_template()
+    elif chat_template_name == "phi":
+        chat_template = get_phi_chat_template_repeat()
+    else:
+        raise ValueError(f"Chat template name {chat_template_name} not found")
+    
     def tokenize_function(examples):
         tokenized_texts = apply_chat_template_repeat(
             base_tokenizer=base_tokenizer,
@@ -475,8 +550,16 @@ def create_translation_dataset_with_template(ds: datasets.Dataset, base_tokenize
     
     return tokenized_dataset
 
-def apply_chat_template(ds: datasets.Dataset, tokenizer: AutoTokenizer, batch_size: int, threads: int) -> datasets.Dataset:
-    chat_template = get_llama32_instruct_chat_template()
+def apply_chat_template(ds: datasets.Dataset, tokenizer: AutoTokenizer, batch_size: int, threads: int, chat_template_name: str = "llama32") -> datasets.Dataset:
+    system_prompt = True
+    if chat_template_name == "llama32":
+        chat_template = get_llama32_instruct_chat_template()
+    elif chat_template_name == "phi":
+        chat_template = get_phi_cot_chat_template()
+        system_prompt = False
+    else:
+        raise ValueError(f"Chat template name {chat_template_name} not found")
+    
     def tokenize_function(examples):
         tokenized_texts = apply_chat_template_normal(
             tokenizer=tokenizer,
@@ -488,6 +571,7 @@ def apply_chat_template(ds: datasets.Dataset, tokenizer: AutoTokenizer, batch_si
             return_tensors="pt",
             padding="longest",
             truncation=True,
+            add_system_message=system_prompt,
         )
         return tokenized_texts
         # return {
