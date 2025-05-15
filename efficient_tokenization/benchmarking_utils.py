@@ -4,13 +4,18 @@ import sys
 from efficient_tokenization.utils import generate_hashed_dir_name, parse_args
 from efficient_tokenization.model_utils import calc_batch_size_stuff
 
-def compile_eval_scripts(all_output_paths: List[str], output_bash_file: str, title: str = ""):
+def compile_eval_scripts(all_output_paths: List[str], output_bash_file: str, title: str = "", main_process_port: bool = False, num_processes: int = 8):
     eval_scripts = []
     missing_list = []
 
+    if main_process_port:
+        process_port = 29500
+    else:
+        process_port = None
     with open(output_bash_file, "a") as bash_file:
         bash_file.write(f"\n# {title}\n")
         for subdir_path in all_output_paths:
+            
 
         # for subdir in os.listdir(base_dir):
         #     subdir_path = os.path.join(base_dir, subdir)
@@ -24,6 +29,9 @@ def compile_eval_scripts(all_output_paths: List[str], output_bash_file: str, tit
                 if os.path.isfile(lm_eval_script_path):
                     with open(lm_eval_script_path, "r") as f:
                         line = f.read().strip()
+                        if process_port is not None:
+                            line = line.replace("--num_processes 8", f"--num_processes {num_processes} --main_process_port {process_port}")
+                            process_port += 1
                         bash_file.write(line + "\n")
                     eval_scripts.append(subdir_path)
                     print(f"Found lm_eval.sh in {subdir_path}")
@@ -37,7 +45,7 @@ def compile_eval_scripts(all_output_paths: List[str], output_bash_file: str, tit
                         print(f"No lm_eval.sh or final_model found in {subdir_path}, maybe still training?")
 
     print(f"Compiled lm_eval scripts from {len(eval_scripts)} directories into {output_bash_file}")
-    return missing_list
+    return missing_list, process_port
 
 
 def get_pre_python_args(args_list: List[str], script_idx: int) -> Dict[str, Any]:
@@ -56,11 +64,31 @@ def get_pre_python_args(args_list: List[str], script_idx: int) -> Dict[str, Any]
             ind += 1
     return pre_args
 
+def parse_args_from_line(line: str, print_warnings: bool = True):
+    """Parse arguments from a line of a bash script"""
+    # Split the line into arguments
+    args_list = line.split()
+    
+    try:
+        script_idx = args_list.index('finetune.py')
+        script_args = args_list[script_idx + 1:]
+        pre_args = get_pre_python_args(args_list, script_idx) if script_idx > 0 else {}
+
+        # Use the original parse_args function with modified sys.argv
+        original_argv = sys.argv
+        sys.argv = ['finetune.py'] + script_args
+        file_args = parse_args()
+        sys.argv = original_argv
+        return file_args, pre_args
+
+    except ValueError:
+        if print_warnings:
+            print(f"Warning: 'finetune.py' not found in line: {line}")
+        return None, None
 
 def parse_args_from_file(file_path : str):
     """Parse arguments from a file containing command lines"""
-    print(f"file_path: {file_path}")
-    
+    # print(f"file_path: {file_path}")
     with open(file_path, 'r') as f:
         lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
     
@@ -68,27 +96,13 @@ def parse_args_from_file(file_path : str):
     pre_args_list = []
     python_lines = []
     for line in lines:
-        # Split the line into arguments
-        args_list = line.split()
-        
-        try:
-            script_idx = args_list.index('finetune.py')
-            script_args = args_list[script_idx + 1:]
-            pre_args = get_pre_python_args(args_list, script_idx) if script_idx > 0 else {}
-
-            # Use the original parse_args function with modified sys.argv
-            original_argv = sys.argv
-            sys.argv = ['finetune.py'] + script_args
-            file_args = parse_args()
-            sys.argv = original_argv
-            
-            file_args_list.append(file_args)
-            pre_args_list.append(pre_args)
-            python_lines.append(line)
-
-        except ValueError:
-            print(f"Warning: 'finetune.py' not found in line: {line}")
+        file_args, pre_args = parse_args_from_line(line)
+        if file_args is None:
             continue
+                
+        file_args_list.append(file_args)
+        pre_args_list.append(pre_args)
+        python_lines.append(line)
 
     return file_args_list, pre_args_list, python_lines
 
@@ -241,7 +255,7 @@ def add_baseline_lm_eval(file_args_obj, pre_args: Dict):
 
     return get_lm_eval_string(output_dir = model_path, 
                               tokenizer_path = None,
-                              base_tokenizer_path=file_args_obj.original_model,
+                              original_model_path=file_args_obj.original_model,
                               tasks = tasks,
                               num_processes = num_processes,
                               limit = limit,
@@ -260,7 +274,7 @@ def add_baseline_lm_eval(file_args_obj, pre_args: Dict):
 
 def get_lm_eval_string(output_dir: str, 
                        tokenizer_path: str = None,
-                       base_tokenizer_path: str = None,
+                       original_model_path: str = None,
                        tasks: List[str] = ["minerva_math"],
                        num_processes: int = 8,
                        limit: int = -1,
@@ -273,12 +287,27 @@ def get_lm_eval_string(output_dir: str,
                        temperature: float = None,
                        top_p: float = 1.0,
                        top_k: int = None,
+                       finetune_embeddings_params_only: bool = False,
                        ) -> str:
-    model_args_str = (f"pretrained={output_dir},tokenizer={tokenizer_path}") if tokenizer_path is not None else f"pretrained={output_dir}"
+    
+    base_tokenizer_path = original_model_path
+    model_args_dict = {}
+    if finetune_embeddings_params_only:
+        embeddings_path = os.path.join(output_dir, "embeddings_only.pt")
+        model_args_dict["pretrained"] = original_model_path
+        model_args_dict["embeddings"] = embeddings_path
+    else:
+        model_args_dict["pretrained"] = output_dir
+    
+    if tokenizer_path is not None:
+        model_args_dict["tokenizer"] = tokenizer_path
+    model_args_str = ",".join([f"{k}={v}" for k, v in model_args_dict.items()])
     extra_config_str = (f"--extra_config base_tokenizer={base_tokenizer_path}") if base_tokenizer_path is not None else ""
     gen_args = f"do_sample={do_sample},temperature={temperature},top_p={top_p}"
+    
     if top_k is not None:
         gen_args += f",top_k={top_k}"
+
     return f"""accelerate launch --num_processes {num_processes} lm_eval_new_tokens \
     --model hf \
     --model_args {model_args_str} \

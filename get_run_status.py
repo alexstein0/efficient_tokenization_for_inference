@@ -20,15 +20,14 @@ from pathlib import Path
 import torch
 import time
 import datetime
-
+from typing import List
 # ---------------------------------------------------------------------------
 # your helper modules
 from efficient_tokenization.utils              import get_latest_checkpoint
 from efficient_tokenization.benchmarking_utils import (
         parse_args_from_file,
         convert_argparse_to_hash_path,          # <‑‑ hashed dir for launcher‑args
-        generate_hashed_dir_name,               # <‑‑ hashed dir from dict banner
-        get_lm_eval_string
+        parse_args_from_line
 )
 
 
@@ -140,7 +139,7 @@ def parse_myq() -> list[dict]:
             continue
 
         for jid in expand_job_id(cols[0]):    # handle array notation
-            jobs.append({"jobid": jid, "state_slurm": cols[4], "node": cols[8]})
+            jobs.append({"jobid": jid, "state_slurm": cols[4], "node": cols[8], "partition": cols[1]})
 
     return jobs
 
@@ -258,10 +257,12 @@ def merge_state(job_slurm_state: str,
             state = "COMPLETING" + (" (preempt)" if live_info.get("cancelled") else "")
         elif slurm_lower == "finished":
             state = "FINISHED"
+        elif slurm_lower == "queued":
+            state = "QUEUED"
         else:                                       # COMPLETING, etc.
             state = slurm_lower
         # ----------- PROGRESS --------
-        p = live_info["progress"]
+        p = live_info.get("progress", None)
         if p:
             progress = (f"{p['pct']:>3d}% "
                         f"{p['step']}/{p['total']}"
@@ -276,20 +277,85 @@ def merge_state(job_slurm_state: str,
 
     return state, progress
 
+def find_jobs_from_jobid_index(job_ids, log_dir="/nfshomes/astein0/.launch/") -> dict[str, List[str]]:
+    job_ids_to_sub_map = {}
+    for jobid in job_ids:
+        parent_id = jobid.split("_")[0]
+        sub_ids = jobid.split("_")[-1]
+        if parent_id not in job_ids_to_sub_map:
+            job_ids_to_sub_map[parent_id] = []
+        job_ids_to_sub_map[parent_id].append(sub_ids)
 
-def live_status_map() -> dict[str,dict]:
+    log_dir = Path(log_dir)
+    if not log_dir.exists():
+        print(f"Log directory {log_dir} not found.")
+        return {}
+
+    job_index_file = log_dir / "jobid_index.txt"
+    if not job_index_file.exists():
+        print(f"Job index file {job_index_file} not found.")
+        return {}
+
+    job_hashs = {}
+    with open(job_index_file, "r") as f:
+        line_read = 0
+        for line in reversed(f.readlines()):
+            if line_read > 100: # limit the number of lines to read
+                break
+            if len(job_hashs) == len(job_ids_to_sub_map):  # stop if we have all the job ids
+                break
+            jobid, authkey, qos, idx = line.strip().split(",")
+            if jobid in job_ids_to_sub_map:
+                job_hashs[jobid] = authkey
+            line_read += 1
+    
+    all_job_lines = {}          
+    if len(job_hashs) != len(job_ids_to_sub_map):
+        missing_job_ids = set(job_ids_to_sub_map.keys()) - set(job_hashs.keys())
+        # print(f"Could not find job hash for {missing_job_ids}")
+        for jobid in missing_job_ids:
+            for job_no in job_ids_to_sub_map[jobid]:
+                full_job_id = f"{jobid}_{job_no}"
+                all_job_lines[full_job_id] = None
+
+    for jobid, hash_id in job_hashs.items():
+        job_file_name = f"job_list_{hash_id}.temp.sh"
+        job_file_path = log_dir / job_file_name
+        if not job_file_path.exists():
+            print(f"Job file {job_file_path} not found.")
+            continue
+        job_no = 1
+        with open(job_file_path, "r") as f:
+            for line in f:
+                if str(job_no) in job_ids_to_sub_map[jobid]:
+                    full_job_id = f"{jobid}_{job_no}"
+                    all_job_lines[full_job_id] = line
+                job_no += 1
+
+    return all_job_lines
+
+
+
+
+def live_status_map() -> tuple[dict[str,dict], set[str]]:
     mapping: dict[str,dict] = {}
 
+    missing_job_ids = set()
     seen_logs = set()
+    job_map = {}
     for job in parse_myq():
+        job_map[job["jobid"]] = job
+
         jid   = job["jobid"]
         state = job["state_slurm"]
+        partition = job["partition"]
         node = None
         if state != "PENDING":
             node = job["node"]
 
         log = newest_log(jid)
         if log is None:
+            missing_job_ids.add(jid)
             continue
 
         seen_logs.add(log.name)
@@ -297,6 +363,7 @@ def live_status_map() -> dict[str,dict]:
         log_info = parse_log(log) 
 
         hashed_dir = log_info["output_dir"]
+        # TODO return the live info for things without logs to get pending run info
         if not hashed_dir:
             continue
         
@@ -304,11 +371,38 @@ def live_status_map() -> dict[str,dict]:
         log_info["log"] = f"{LOG_DIR.name}/{log.name}"
         log_info["jid"] = jid
         log_info["node"] = node
+        log_info["partition"] = partition
 
         mapping[hashed_dir] = log_info
-
+        
     # ------------------------------------------------------------------
-    # Phase 2 – pick up *recent* logs that don’t belong to any running / pending
+    # Phase 2 – picks up jobs that have not started yet, gets them from launch files
+    #           Will only be jobs that are "missing" (meaning that they dont have a log yet)
+    # ------------------------------------------------------------------
+
+    missing_job_lines = find_jobs_from_jobid_index(list(missing_job_ids))
+    for jobid, line in missing_job_lines.items():
+        if line is None:
+            pass
+            # print(f"Could not find job hash for {jobid}")
+        else:
+            file_args, pre_args = parse_args_from_line(line, print_warnings=False)
+            if file_args is None:
+                continue
+
+            hashed_dir = convert_argparse_to_hash_path(
+                file_args, accelerate_args=pre_args, output_folder=args.output_root
+            )
+            log_info = {}
+            job_info = job_map[jobid]
+            log_info["state"] = "QUEUED"
+            log_info["jid"] = jobid
+            log_info["partition"] = job_info["partition"]
+            log_info["progress"] = None
+
+        mapping[hashed_dir] = log_info
+    # ------------------------------------------------------------------
+    # Phase 3 – pick up *recent* logs that don’t belong to any running / pending
     #           Slurm job (e.g. pre‑empted or crashed runs).
     # ------------------------------------------------------------------
     newest_logs = sorted(
@@ -362,6 +456,7 @@ def main(args: argparse.Namespace) -> None:
     file_args_list, pre_args_list, _ = parse_args_from_file(args.launcher_file)
 
     rows = []
+    jobs_by_partition = {}
     for file_args, pre_args in zip(file_args_list, pre_args_list):
         hashed_dir = convert_argparse_to_hash_path(
             file_args, accelerate_args=pre_args, output_folder=args.output_root
@@ -371,13 +466,20 @@ def main(args: argparse.Namespace) -> None:
         static_status = get_run_status(hashed_dir)
         live_info = live.get(hashed_dir, None)
 
+        if live_info is None:
+            live_info = {}
+
+        if "--num_processes" in pre_args:
+            live_info["num_processes"] = pre_args['--num_processes']
+
+
         if static_status == "Final model exists":
             if live_info.get("state", None) == "running":
                 slurm_state = "COMPLETING"
             else:
                 slurm_state = "FINISHED"
         elif live_info:
-            slurm_state = live_info["state"]
+            slurm_state = live_info.get("state", "-")
         else:
             slurm_state = "-"
 
@@ -389,23 +491,34 @@ def main(args: argparse.Namespace) -> None:
             slurm_state,
             live_info
         )
+        if live_info is not None:
+            live_info["slurm_state"] = slurm_state
 
-        logfile = live_info["log"] if live_info else "-"
+        if live_info is not None and live_info.get('partition') is not None:
+            if live_info['partition'] not in jobs_by_partition:
+                jobs_by_partition[live_info['partition']] = []
+            jobs_by_partition[live_info['partition']].append(live_info)
+
+        logfile = live_info.get("log", "-") if live_info else "-"
         info_list = []
         eta = "-"
         if live_info:
-            if live_info['node'] is not None:
+            if live_info.get('node') is not None:
                 info_list.append(f"{live_info['node']:5s}")
-            if "--num_processes" in pre_args:
-                info_list.append(f"#gpus={pre_args['--num_processes']:2s}")
+            if "num_processes" in live_info:
+                info_list.append(f"#gpus={live_info['num_processes']:2s}")
             if 'ts' in live_info and live_info['ts'] is not None:
                 info_list.append(f"update={live_info['ts']:10s}")
             if "gpu" in live_info:
                 info_list.append(f"gpu={live_info['gpu']}")
-            if live_info['progress'] is not None and slurm_state == "running":
+            if live_info.get('progress', None) is not None and slurm_state == "running":
                 eta = live_info['progress']['eta']
+            if live_info.get('partition') is not None:
+                info_list.append(f"({live_info['partition']})")
+            if logfile == "-" and "jid" in live_info:
+                info_list.append(f"jid={live_info['jid']}")
         info_str = " ".join(info_list)
-        last_updated = live_info["last_updated"] if live_info and "last_updated" in live_info else "-"
+        last_updated = live_info.get("last_updated", "-") if live_info else "-"
         rows.append((hashed_dir, static_status, state, progress, logfile, last_updated, eta, info_str))
 
     # nice output
@@ -419,6 +532,27 @@ def main(args: argparse.Namespace) -> None:
     output_str += "-+-".join("-"*w for w in col_w) + "\n"
     for r in rows:
         output_str += " | ".join(str(r[i]).ljust(col_w[i]) for i in range(len(hdr))) + "\n"
+
+    if len(jobs_by_partition) > 0:
+        output_str += "\nPending jobs by Partition:\n"
+        for partition, jobs in jobs_by_partition.items():
+            gpus = 0
+            count = 0
+            queued_gpus = 0
+            queued_count = 0
+            for job_info in jobs:
+                if not job_info.get('slurm_state').lower() in ["running", "pending", "queued", "completing"]:
+                    continue
+
+                if job_info.get('slurm_state').lower() == "queued":
+                    queued_gpus += int(job_info['num_processes'])
+                    queued_count += 1
+                else:
+                    gpus += int(job_info['num_processes'])
+                    count += 1
+
+            part = f"{partition}:"
+            output_str += f"{part:10s} {count:1d} jobs ({queued_count:1d} queued), {gpus:2d} gpus ({queued_gpus:2d} queued)\n"
     return output_str
 
 if __name__ == "__main__":

@@ -41,6 +41,13 @@ def cli_evaluate_with_new_tokens(args: Union[argparse.Namespace, None] = None, e
 
     # update the evaluation tracker args with the output path and the HF token
     if args.output_path:
+        if "embeddings" in extra_config_dict:
+            new_only = extra_config_dict.get("new_only", False)
+            args.model_args = args.model_args + f",new_only={new_only}"
+            run_name = extra_config_dict.get("embeddings").split("/")[-3]
+            run_name += f"-new_only" if new_only else f"-embeddings"
+            args.output_path = os.path.join(args.output_path, run_name)
+            args.model_args = args.model_args + f",embeddings={extra_config_dict.get('embeddings')}"
         args.hf_hub_log_args += f",output_path={args.output_path}"
     if os.environ.get("HF_TOKEN", None):
         args.hf_hub_log_args += f",token={os.environ.get('HF_TOKEN')}"
@@ -175,6 +182,8 @@ def cli_evaluate_with_new_tokens(args: Union[argparse.Namespace, None] = None, e
         for config in model_args_config_split:
             key, value = config.split("=")
             model_args_config[key] = value
+
+        results["config"]["extra_config"] = extra_config_dict
 
         tokenizer_name = model_args_config.get("tokenizer", model_args_config.get("pretrained", None))
         if tokenizer_name is not None:

@@ -1,0 +1,24 @@
+# Instruct model embeddings
+#1000
+accelerate launch --num_processes 8 finetune.py --run-lm-eval --limit 100 --total-batch-size 64 --max-train-steps 2500    --batch-size 2 --eval-batch-size 1 --eval-steps 100 --benchmark-steps 250 --learning-rate 2e-5 --warmup-steps 250 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset magpie-default-tokenized_1000,magpie-translation-tokenized_1000    --task-name mixed --embedding-init-strategy import  --import-path output/full_patching/80c6810f-Llama-3.2-3B-Instruct-mixed-1000/final_model    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/Llama-3.2-tokenizer-magpie_pro_300k_filtered-math-empty-start-1000    --wandb-tags mixed,embeddings,extend_merge,new_runs,magpie     --num-new-tokens 1000 --experiment-name full_patching_extend  --benchmark-tasks ifeval  --log-samples --model meta-llama/Llama-3.2-3B-Instruct --finetune-params first_last --lr-schedule cosine  --save-results 3
+
+# 500
+accelerate launch --num_processes 8 finetune.py --run-lm-eval --limit 100 --total-batch-size 64 --max-train-steps 2500    --batch-size 2 --eval-batch-size 1 --eval-steps 100 --benchmark-steps 250 --learning-rate 2e-5 --warmup-steps 250 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset magpie-default-tokenized_500,magpie-translation-tokenized_500    --task-name mixed --embedding-init-strategy import  --import-path output/full_patching/4b9504d3-Llama-3.2-3B-Instruct-mixed-500/final_model    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/Llama-3.2-tokenizer-magpie_pro_300k_filtered-math-empty-start-500    --wandb-tags mixed,embeddings,extend_merge,new_runs,magpie     --num-new-tokens 500 --experiment-name full_patching_extend  --benchmark-tasks ifeval  --log-samples --model meta-llama/Llama-3.2-3B-Instruct --finetune-params first_last --lr-schedule cosine  --save-results 3
+
+# 100
+accelerate launch --num_processes 8 finetune.py --run-lm-eval --limit 100 --total-batch-size 64 --max-train-steps 2500    --batch-size 2 --eval-batch-size 1 --eval-steps 100 --benchmark-steps 250 --learning-rate 2e-5 --warmup-steps 250 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset magpie-default-tokenized_100,magpie-translation-tokenized_100    --task-name mixed --embedding-init-strategy import  --import-path output/full_patching/5c0eb32b-Llama-3.2-3B-Instruct-mixed-100/final_model    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/Llama-3.2-tokenizer-magpie_pro_300k_filtered-math-empty-start-100    --wandb-tags mixed,embeddings,extend_merge,new_runs,magpie     --num-new-tokens 100 --experiment-name full_patching_extend  --benchmark-tasks ifeval  --log-samples --model meta-llama/Llama-3.2-3B-Instruct --finetune-params first_last --lr-schedule cosine  --save-results 3
+
+# 10
+accelerate launch --num_processes 8 finetune.py --run-lm-eval --limit 100 --total-batch-size 64 --max-train-steps 2500    --batch-size 2 --eval-batch-size 1 --eval-steps 100 --benchmark-steps 250 --learning-rate 2e-5 --warmup-steps 250 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset magpie-default-tokenized_10,magpie-translation-tokenized_10    --task-name mixed --embedding-init-strategy import  --import-path output/full_patching/f276bbe3-Llama-3.2-3B-Instruct-mixed-10/final_model    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/Llama-3.2-tokenizer-magpie_pro_300k_filtered-math-empty-start-10    --wandb-tags mixed,embeddings,extend_merge,new_runs,magpie     --num-new-tokens 10 --experiment-name full_patching_extend  --benchmark-tasks ifeval  --log-samples --model meta-llama/Llama-3.2-3B-Instruct --finetune-params first_last --lr-schedule cosine  --save-results 3
+
+# 0
+accelerate launch --num_processes 8 finetune.py --run-lm-eval --limit 100 --total-batch-size 64 --max-train-steps 2500    --batch-size 2 --eval-batch-size 1 --eval-steps 100 --benchmark-steps 250 --learning-rate 2e-5 --warmup-steps 250 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset magpie-default-tokenized_0,magpie-translation-tokenized_0    --task-name mixed    --wandb-tags mixed,baseline,embeddings,new_runs,magpie   --tokenizer-path meta-llama/Llama-3.2-3B-Instruct    --num-new-tokens 0 --experiment-name full_patching_extend  --benchmark-tasks ifeval  --log-samples --model meta-llama/Llama-3.2-3B-Instruct --finetune-params first_last --lr-schedule cosine  --save-results 3
+
+
+# output/full_patching/80c6810f-Llama-3.2-3B-Instruct-mixed-1000
+# output/full_patching/4b9504d3-Llama-3.2-3B-Instruct-mixed-500
+# output/full_patching/5c0eb32b-Llama-3.2-3B-Instruct-mixed-100
+# output/full_patching/f276bbe3-Llama-3.2-3B-Instruct-mixed-10
+# output/full_patching/c5764fce-Llama-3.2-3B-Instruct-mixed-0
+
+

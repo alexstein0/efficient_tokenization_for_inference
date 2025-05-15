@@ -29,7 +29,7 @@ disable_progress_bar()
 
 import argparse
 
-from efficient_tokenization.tokenize_simple import load_pretokenizer, get_genqa_data, get_magpie_data
+from efficient_tokenization.tokenize_simple import load_pretokenizer, get_genqa_data, get_magpie_data, get_gsm8k_cot_data
 from efficient_tokenization.tokenization_utils import SaveModule, read_training_info, read_tokenizer_from_model
 
 logger = logging.getLogger(__name__)
@@ -284,7 +284,7 @@ def find_common_pair_parallel(dataset: Dataset) -> Tuple[Tuple[bytes, bytes], in
     Each worker counts pairs in parallel, and we reduce them to find the single most common pair.
     Returns (most_common_pair, occurrences, total_token_count).
     """
-    num_workers = concurrent.futures.ProcessPoolExecutor()._max_workers
+    num_workers = min(len(dataset), concurrent.futures.ProcessPoolExecutor()._max_workers)
 
     # Spawn parallel processes
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -678,7 +678,7 @@ def bpe_continue_train(
                 "state": step,
             }
             print(f"Saving at step {step}")
-            save_module.save(merges=new_merges, dataset_sizes=dataset_sizes, additional_info=additional_info, ranks=initial_ranks)
+            save_module.save(merges=new_merges, dataset_sizes=dataset_sizes, additional_info=additional_info, ranks=initial_ranks, save_ext="-step")
             # save_path = f"{save_loc}/{save_file_name}"
             # new_added_tokens = get_new_added_tokens(initial_ranks, new_merges)
             # added_tokens = vocab_size - len(initial_ranks)
@@ -759,7 +759,7 @@ def get_data(cont_or_start: str, force_retokenize: bool, save_tokenized_data: bo
         ds = load_from_disk(os.path.join(dataset_path, tokenized_data_name)) #.select_columns('text')
         logger.info("Dataset loaded")
     except:
-        logger.info("Downloading and processing raw dataset")
+        logger.info(f"Downloading and processing raw dataset: {raw_data_name}")
         tok = tokenizer
         # tok = PreTrainedTokenizerFast(vocab_file=os.path.join(tokenizer_path_old, tokenizer_file_old))
         tok.backend_tokenizer.pre_tokenizer = pre_tok
@@ -777,10 +777,13 @@ def get_data(cont_or_start: str, force_retokenize: bool, save_tokenized_data: bo
             ds = get_genqa_data(ds, tokenizer=tok, track_role=False, threads=threads, batch_size=batch_size)
         elif raw_data_name == "magpie_pro_300k_filtered":
             ds = get_magpie_data(ds, tokenizer=tok, track_role=False, threads=threads, batch_size=batch_size)
+        elif raw_data_name.startswith("gsm8k"):
+            ds = get_gsm8k_cot_data(ds, tokenizer=tok, track_role=False, threads=threads, batch_size=batch_size)
         else:
             pass
 
         if save_tokenized_data:
+            print(f"Saving tokenized data to {dataset_path}/{tokenized_data_name}")
             save_data_dir = os.path.join(dataset_path, tokenized_data_name)
             os.makedirs(save_data_dir, exist_ok=True)
             ds.save_to_disk(save_data_dir)
@@ -1188,7 +1191,7 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--num_proc",
+        "--num-proc",
         type=int,
         default=threads,
         help="Number of threads for parallel processing"
@@ -1206,7 +1209,7 @@ def parse_args():
 
     save_interval_list = args.save_interval.split(",")
     if len(save_interval_list) == 1:
-        args.save_interval = range(args.added_tokens, step=int(args.save_interval))
+        args.save_interval = range(0, args.added_tokens, int(args.save_interval))
     else:
         args.save_interval = [int(interval) for interval in save_interval_list]
 

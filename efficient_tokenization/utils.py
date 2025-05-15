@@ -252,7 +252,7 @@ def parse_args():
     
     # vocab extension params
     args.add_argument("--embedding-init-strategy", type=str,
-                     choices=["default", "random", "clone", "mean", "zeros", "merge", None],
+                     choices=["default", "random", "clone", "mean", "zeros", "merge", "import", None],
                      default=None,
                      help="Strategy for initializing new token embeddings")
     args.add_argument("--num-new-tokens", type=int,
@@ -289,9 +289,9 @@ def parse_args():
                       help="How many results to save to a file while running benchmarking loop")
     args.add_argument("--do-sample", action="store_true",
                       help="Whether to sample from the model", default=False)
-    args.add_argument("--temperature", type=float, default=None,
+    args.add_argument("--temperature", type=float, default=0.0,
                       help="Temperature for sampling")
-    args.add_argument("--top-p", type=float, default=None,
+    args.add_argument("--top-p", type=float, default=1.0,
                       help="Top-p for sampling")
     args.add_argument("--top-k", type=int, default=None,
                       help="Top-k for sampling")

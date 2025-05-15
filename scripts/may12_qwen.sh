@@ -1,18 +1,87 @@
-accelerate launch --num_processes 8 -m lm_eval     --model_args pretrained=Qwen/Qwen3-0.6B     \
-    --gen_kwargs do_sample=True,temperature=0.6,top_p=.95,top_k=20,max_gen_toks=2048     \
-    --tasks gsm8k     --batch_size auto     --output_path ./e6val_results/gsm8k \
-    --log_samples  --fewshot_as_multiturn --apply_chat_template
+# # accelerate launch --num_processes 8 -m lm_eval     --model_args pretrained=Qwen/Qwen3-0.6B     \
+# #     --gen_kwargs do_sample=True,temperature=0.6,top_p=.95,top_k=20,max_gen_toks=2048     \
+# #     --tasks gsm8k     --batch_size auto     --output_path ./eval_results/gsm8k \
+# #     --log_samples  --fewshot_as_multiturn --apply_chat_template
 
-# python train_tokenizer.py \
-#     --raw-data-name magpie_pro_300k_filtered \
-#     --dataset-source-path /cmlscratch/astein0/efficient_tokenization_for_inference/datasets \
-#     --tokenized-data-name magpie_tokenized-qwen \
-#     --pre-tok-name empty \
-#     --cont-or-start start \
-#     --batch-size 100 \
-#     --added-tokens 10000 \
-#     --save-interval 1,10,50,100,500,1000,2000,3000,4000,5000,6000,7000,8000,9000,10000 \
-#     --tokenizer-path-old Qwen/Qwen3-0.6B \
-#     --tokenizer-source huggingface \
-#     --save-tokenized-data \
-#     --save-loc tokenizers/qwen_magpie
+
+
+# # python train_tokenizer.py \
+# #     --raw-data-name gsm8k_cot_qwen \
+# #     --pre-tok-name empty \
+# #     --cont-or-start start \
+# #     --batch-size 100 \
+# #     --added-tokens 10000 \
+# #     --tokenizer-path-old Qwen/Qwen3-0.6B \
+# #     --tokenizer-source huggingface \
+# #     --save-interval 1,10,50,100,500,1000,2000,3000,4000,5000,6000,7000,8000,9000,10000 \
+# #     --dataset-source-path datasets \
+# #     --save-loc tokenizers/qwen_gsm8k \
+# #     --save-tokenized-data
+
+# # python shrink_tokenizer.py \
+# #     --old-tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-10000 \
+# #     --num-new-tokens-list 1,10,50,100,500,1000,2000,3000,4000,5000,6000,7000,8000,9000,10000 \
+# #     --add-special-tokens
+
+# # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_0 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path Qwen/Qwen3-0.6B --chat-template-name qwen
+# # # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_1 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-1 --chat-template-name qwen
+# # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_10 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-10 --chat-template-name qwen
+# # # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_50 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-50 --chat-template-name qwen
+# # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_100 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-100 --chat-template-name qwen
+# # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_500 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-500 --chat-template-name qwen
+# # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_1000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-1000 --chat-template-name qwen
+# # # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_2000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-2000 --chat-template-name qwen
+# # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_3000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-3000 --chat-template-name qwen
+# # # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_4000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-4000 --chat-template-name qwen
+# # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_5000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-5000 --chat-template-name qwen
+# # # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_6000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-6000 --chat-template-name qwen
+# # # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_7000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-7000 --chat-template-name qwen
+# # # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_8000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-8000 --chat-template-name qwen
+# # # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_9000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-9000 --chat-template-name qwen
+# # python data_preprocessing.py --raw-data-name gsm8k --dataset-path datasets/gsm8k --save-dataset-name tokenized_10000 --task default,translation --model Qwen/Qwen3-0.6B --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-10000 --chat-template-name qwen
+
+
+# #### base model new tokens only
+# 10000
+accelerate launch --num_processes 4  --main-process-port 12800 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_10000,gsm8k-translation-qwen-tokenized_10000    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-10000    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 10000 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B-Base --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 5000
+accelerate launch --num_processes 4  --main-process-port 12401 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_5000,gsm8k-translation-qwen-tokenized_5000    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-5000    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 5000 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B-Base --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+3000
+accelerate launch --num_processes 4  --main-process-port 12402 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_3000,gsm8k-translation-qwen-tokenized_3000    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-3000    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 3000 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B-Base --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 1000
+accelerate launch --num_processes 4  --main-process-port 12403 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_1000,gsm8k-translation-qwen-tokenized_1000    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-1000    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 1000 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B-Base --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 500
+accelerate launch --num_processes 4  --main-process-port 12404 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_500,gsm8k-translation-qwen-tokenized_500    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-500    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 500 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B-Base --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 100
+accelerate launch --num_processes 4  --main-process-port 12405 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_100,gsm8k-translation-qwen-tokenized_100    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-100    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 100 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B-Base --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 0
+accelerate launch --num_processes 4  --main-process-port 12390 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_0,gsm8k-translation-qwen-tokenized_0    --task-name mixed    --wandb-tags mixed,baseline,embeddings,new_runs,gsm8k,trasnlation_data,default_data   --tokenizer-path Qwen/Qwen3-0.6B-Base    --num-new-tokens 0 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B-Base --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+
+# Instruct model new tokens only
+# 10000
+accelerate launch --num_processes 4  --main-process-port 12391 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_10000,gsm8k-translation-qwen-tokenized_10000    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-10000    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 10000 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 5000
+accelerate launch --num_processes 4  --main-process-port 12392 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_5000,gsm8k-translation-qwen-tokenized_5000    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-5000    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 5000 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 3000
+accelerate launch --num_processes 4  --main-process-port 12393 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_3000,gsm8k-translation-qwen-tokenized_3000    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-3000    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 3000 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 1000
+accelerate launch --num_processes 4  --main-process-port 12394 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_1000,gsm8k-translation-qwen-tokenized_1000    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-1000    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 1000 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 500
+accelerate launch --num_processes 4  --main-process-port 12395 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_500,gsm8k-translation-qwen-tokenized_500    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-500    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 500 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 100
+accelerate launch --num_processes 4  --main-process-port 12396 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_100,gsm8k-translation-qwen-tokenized_100    --task-name mixed --embedding-init-strategy merge    --tokenizer-path /cmlscratch/astein0/efficient_tokenization_for_inference/tokenizers/qwen_gsm8k-100    --wandb-tags mixed,embeddings,extend_merge,new_runs,gsm8k,trasnlation_data,default_data     --num-new-tokens 100 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3
+
+# 0
+accelerate launch --num_processes 4  --main-process-port 12397 finetune.py --run-lm-eval --limit 64 --total-batch-size 16 --max-train-steps 1000    --batch-size 2 --eval-batch-size 1 --eval-steps 50 --benchmark-steps 100 --learning-rate 5e-4 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset gsm8k-default-qwen-tokenized_0,gsm8k-translation-qwen-tokenized_0    --task-name mixed    --wandb-tags mixed,baseline,embeddings,new_runs,gsm8k,trasnlation_data,default_data   --tokenizer-path Qwen/Qwen3-0.6B    --num-new-tokens 0 --experiment-name qwen_full_patching  --benchmark-tasks gsm8k  --log-samples --model Qwen/Qwen3-0.6B --finetune-params new_tokens_only --lr-schedule cosine  --save-results 3

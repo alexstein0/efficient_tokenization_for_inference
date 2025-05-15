@@ -9,7 +9,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import FullOptimStateDic
 from accelerate.utils import InitProcessGroupKwargs, set_seed, ProjectConfiguration, DataLoaderConfiguration, release_memory
 from accelerate.state import PartialState
 from tqdm import tqdm
-from transformers import set_seed, AutoTokenizer, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+from transformers import set_seed, AutoTokenizer, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup, AutoModelForCausalLM
 import datasets
 # from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
 import torch.distributed as dist
@@ -67,10 +67,9 @@ from lm_eval.tasks import TaskManager
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
 import gc
-
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
 def log_loss(metrics_dict, output_dir, filename="loss_log.csv"):
     """Save metrics to a CSV file for tracking."""
@@ -126,9 +125,10 @@ def run_benchmark_loop(accelerator, model, config: Dict, step_no: str = None):
         # "old_tokenizer": config["base_tokenizer"],  # This will be your tokenizer object directly
         # "pre_tok_name": config["pre_tok_name"],
         # "parallelize": True,
-        "do_sample": False,
-        "temperature": None,
-        "top_p": None,
+        "do_sample": config.get("do_sample", False),
+        "temperature": config.get("temperature", None),
+        "top_p": config.get("top_p", None),
+        "top_k": config.get("top_k", None),
         "trust_remote_code": True
     }
     if model_args_dict.get("trust_remote_code", False):
@@ -202,7 +202,7 @@ def run_benchmark_loop(accelerator, model, config: Dict, step_no: str = None):
         # confirm_run_unsafe_code=confirm_run_unsafe_code,
         # **request_caching_args,
     )
-
+    logger.debug(f"completed evaluation {accelerator.process_index}")
     accelerator.wait_for_everyone()
     # output_path = f"./eval_results{"" if config["experiment"] == None or len(config["experiment"]) == 0 else f"/{config['experiment']}"}"
     # TODO SAVE predictions
@@ -247,10 +247,11 @@ def run_benchmark_loop(accelerator, model, config: Dict, step_no: str = None):
         output_dict["pct_new_tokens"] = sum(pct_new_tokens) / len(pct_new_tokens)
         num_results_to_save = config.get("save_results", 0)
         if num_results_to_save > 0:
-            samples = results["samples"][task_names[0]]
+            samples = results["samples"][task_names[0]]  # currently only saving results from main process but thats ok bc its just for logging
             save_path = os.path.join("eval_results", config["experiment"], config["save_results_dir"], f"temp_results_step{step_no}.json")
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             with open(save_path, "w") as f:
+                print(f"Saving {min(num_results_to_save, len(samples))} samples to {save_path}")
                 json.dump(samples[:min(num_results_to_save, len(samples))], f)
     return output_dict
 
@@ -432,7 +433,12 @@ def main(args):
     ###### OUTPUT FILE NAMING STUFF ######
     logger.info(f"Setting output directory with unique hash of params...")
     # ablation params are:
-    model_name = args.model.split('/')[-1] # 0. model
+    model_name_split = args.model.split('/')
+    # 0. model
+    if model_name_split[-1] == "final_model" and len(model_name_split) > 1:
+        model_name = model_name_split[-2]
+    else:
+        model_name = model_name_split[-1]
     tokenizer_path = args.tokenizer_path # 1. tokenizer_path
     finetune_params = args.finetune_params # 1. finetune_params
     embedding_init_strategy = args.embedding_init_strategy # 2. embedding_init_strategy
@@ -494,6 +500,9 @@ def main(args):
     if finetune_params_prefreeze == "lora" or finetune_params == "lora":
         params_dict.update(lora_configs)
     
+    embeddings_only_params = ["new_tokens_only", "embeddings"]
+    finetune_embeddings_params_only = (finetune_params in embeddings_only_params or finetune_params is None) and (finetune_params_prefreeze in embeddings_only_params or finetune_params_prefreeze is None)
+
     if args.output_dir is not None:
         output_dir = args.output_dir
     else:
@@ -597,21 +606,46 @@ def main(args):
 
     ###### INIT MODEL ######
     logger.info(f"Loading model from {args.model}...")
-    model = AutoLigerKernelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-        # cross_entropy=True,
-        # fused_linear_cross_entropy=False,
-        # config=config,
-        # use_cache=False,  # Disable KV cache during training
-    )
-    
+    use_liger = args.use_liger and not args.model.lower().split("/")[-1].startswith("phi")
+    if use_liger:
+        print("Using Liger")
+        model = AutoLigerKernelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            # cross_entropy=False,
+            # fused_linear_cross_entropy=True,
+            # rms_norm=False,
+            # swiglu=False,
+            # config=config,
+            # use_cache=False,  # Disable KV cache during training
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16
+        )
+
+    # do a small eval before doing ANYTHING
+    # if eval_before_extending:
+    #     logger.info("Doing a small eval before doing anything else")
+    #     eval_results = evaluate(model, eval_loader, None, eval_config=None, will_benchmark=True, will_eval=False, update_step="BEFORE_EXTENDING")
+    #     logger.info(f"Eval results: {eval_results}")
+
     if hasattr(model, "enable_input_require_grads"):
         # TODO not sure what this does
         model.enable_input_require_grads()
 
     model.gradient_checkpointing_enable()
+
+    ###### INIT LOSS TRACKING ######
+    logger.info(f"Initializing loss tracking...")
+    train_other_loss_types = args.train_losses_to_track
+    eval_other_loss_types = args.eval_losses_to_track
+    try:
+        train_other_loss_types.remove(main_loss_type)
+    except:
+        pass
 
     ###### INIT TOKENIZER ######
     logger.info("Loading tokenizer...")
@@ -644,25 +678,23 @@ def main(args):
         base_tokenizer.pad_token = base_tokenizer.eos_token
 
 
-    original_vocab_size = len(base_tokenizer)
-    model.config.original_vocab_size = original_vocab_size
-    logger.info(f"Tokenizer vocab size: {len(tokenizer)}, model vocab size: {original_vocab_size}")
-
-    assert num_new_tokens == len(tokenizer) - original_vocab_size, f"tokenizer adding different number than num_new tokens: args: {args.num_new_tokens} != tok: {len(tokenizer) - original_vocab_size}"
-    
-    ###### INIT LOSS TRACKING ######
-    logger.info(f"Initializing loss tracking...")
-    train_other_loss_types = args.train_losses_to_track
-    eval_other_loss_types = args.eval_losses_to_track
-    try:
-        train_other_loss_types.remove(main_loss_type)
-    except:
-        pass
-
     ###### EXTEND MODEL EMBEDDINGS ######
-    if embedding_init_strategy is not None and num_new_tokens > 0:
-        if model.config.vocab_size == original_vocab_size + num_new_tokens:
-            logger.info(f"Model has already extended embeddings with {num_new_tokens} new tokens")
+    original_vocab_size = len(base_tokenizer)
+    new_vocab_size = len(tokenizer)
+    model.config.original_vocab_size = original_vocab_size
+    model.config.updated_vocab_size = new_vocab_size
+
+    logger.info(f"New Tokenizer vocab size: {new_vocab_size}, Orignal Tokenizer vocab size: {original_vocab_size}, model config vocab size: {model.config.vocab_size}, embedding (input/output) size: {model.get_input_embeddings().weight.shape[0]}/{model.get_output_embeddings().weight.shape[0]}")
+
+    assert num_new_tokens == new_vocab_size - original_vocab_size, f"tokenizer adding different number than num_new tokens: args: {args.num_new_tokens} != tok: {new_vocab_size - original_vocab_size}"
+    
+    # num_new_tokens_to_add = num_new_tokens - (model.config.vocab_size - len(base_tokenizer))  
+    # if num_new_tokens_to_add != num_new_tokens:
+    #     logger.info(f"Model has extra embeddings that arent in the tokenizer, so we are only adding {num_new_tokens_to_add} new tokens, however we still will need to initialize all of the embeddings")
+
+    if num_new_tokens > 0:
+        if embedding_init_strategy is None:
+            assert model.config.vocab_size >= new_vocab_size, "no init strategy so must already have enough embeddings"
         else:
             # Extend model embeddings
             logger.info(f"Extending model embeddings with strategy: {embedding_init_strategy} and adding {num_new_tokens} new tokens")
@@ -670,10 +702,13 @@ def main(args):
                 model, 
                 num_new_tokens, 
                 init_strategy=embedding_init_strategy,
-                tokenizer=tokenizer
+                tokenizer=tokenizer,
+                import_path=args.import_path
             )
-            if "new_tokens" not in eval_other_loss_types:
-                eval_other_loss_types.append("new_tokens")
+        # if model.config.vocab_size == original_vocab_size + num_new_tokens:
+        #     logger.info(f"Model has already extended embeddings with {num_new_tokens} new tokens")
+        if "new_tokens" not in eval_other_loss_types:
+            eval_other_loss_types.append("new_tokens")        
     else:
         # not extending embeddings
         logger.info(f"Not extending model embeddings")
@@ -685,55 +720,18 @@ def main(args):
             train_other_loss_types.remove("new_tokens")
         if "new_tokens" in eval_other_loss_types:
             eval_other_loss_types.remove("new_tokens")
-
+        new_vocab_size = model.config.vocab_size
+        
     embedding_size_in = model.get_input_embeddings().weight.shape[0]
     embedding_size_out = model.get_output_embeddings().weight.shape[0]
-    new_vocab_size = len(tokenizer.get_vocab())
     if embedding_size_in != new_vocab_size or embedding_size_out != new_vocab_size:
-        raise ValueError(f"Embedding size {embedding_size_in}/{embedding_size_out} (input/output) does not match vocab size {new_vocab_size}")
+        pass
+        # raise ValueError(f"Embedding size {embedding_size_in}/{embedding_size_out} (input/output) does not match vocab size {new_vocab_size}")
+        # this check doesnt work because sometimes models have extra embeddings that arent in the tokenizer
 
     ###### DATA/TASK STUFF ######
     logger.info(f"Setting up data/task stuff...")
-    # if task_name == "SFT":
-    #     data_collator = MyPaddingCollator(
-    #         tokenizer=tokenizer,
-    #         max_length=args.max_length if hasattr(args, 'max_length') else None
-    #     )
-    #     if "translated" in other_loss_types:
-    #         other_loss_types.remove("translated")
-
-    #     if "translated" in eval_other_loss_types:
-    #         eval_other_loss_types.remove("translated")
-
-    # elif task_name == "translation":
-    #     data_collator = MyPaddingCollatorWithLossMask(
-    #         tokenizer=tokenizer,
-    #         max_length=args.max_length if hasattr(args, 'max_length') else None
-    #     )
-    #     if "translated" not in other_loss_types and main_loss_type != "translated":
-    #         other_loss_types.append("translated")
-
-    #     if "translated" not in eval_other_loss_types:
-    #         eval_other_loss_types.append("translated")
-
-    # elif task_name == "mixed":
-    #     data_collator = MyPaddingCollatorGeneral(
-    #         tokenizer=tokenizer,
-    #         max_length=args.max_length if hasattr(args, 'max_length') else None
-    #     )
-    #     other_loss_types = []
-    #     if "mixed" not in eval_other_loss_types:
-    #         eval_other_loss_types.append("mixed")
-    #     if "new_tokens" not in eval_other_loss_types:
-    #         eval_other_loss_types.append("new_tokens")
-    #     if "all" not in eval_other_loss_types:
-    #         eval_other_loss_types.append("all")
-    #     # we will select the loss type based on the dataset row
-    #     # This collator will handle both normal and repeat samples in the same batch.
-    # else:
-    #     raise ValueError(f"Invalid task name: {task_name}")
-
-
+    
     # we will select the loss type based on the dataset row
     # This collator will handle both normal and repeat samples in the same batch.    
     data_collator = MyPaddingCollatorGeneral(
@@ -797,6 +795,7 @@ def main(args):
         elif finetuning_params == "new_tokens_only":
             model = freeze_old_embeddings(model, num_new_tokens)
             model_is_frozen = True
+            logger.info(f"Freezing old embeddings, so requires_grad is not accurate description of trainable params")
         elif finetuning_params == "embeddings":
             model = freeze_model_except_embeddings(model)
             model_is_frozen = True
@@ -820,8 +819,6 @@ def main(args):
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Finetuning_params: {finetuning_params}, Trainable parameters: {trainable_params:,} Total parameters: {total_params:,} ({trainable_params/total_params:.2%} of total)")
-        # if args.wandb and state.is_main_process:
-        #     wandb.log({"trainable_params": trainable_params, "total_params": total_params})
         
         return model, model_is_frozen
     
@@ -972,6 +969,9 @@ def main(args):
     total_batched_samples = 0
     prev_training_time = 0
 
+    log_step = args.log_step + resume_step  # start logging at the step specified by the log_step arg + the step number of the checkpoint
+    batch_skips = 0
+
     # loss tracking
     cumulative_batch_counter = 0  # number of batches processed since last accumulation
     cumulative_token_counter = 0  # all tokens processed across all processes
@@ -1006,10 +1006,8 @@ def main(args):
             cumulative_batch_counter = state_dict["cumulative_batch_counter"]
             cumulative_token_counter = state_dict["cumulative_token_counter"]
             cumulative_new_token_counter = state_dict["cumulative_new_token_counter"]
-            batch_skips = int((epoch_step - 1)*gradient_accumulation_steps)
             prev_training_time = state_dict.get("training_time", 0)
-            # batch_skips = len(train_loader) - 5
-            # TODO switch to correct finetuning params based on if past unfreeze step
+            batch_skips = int((epoch_step - 1)*gradient_accumulation_steps)
             if batch_skips >= len(train_loader):
                 logger.warning(f"Epoch step {batch_skips} is greater than the number of batches in the train loader {len(train_loader)}")
                 epoch_step = -1
@@ -1018,11 +1016,25 @@ def main(args):
                 skip_loader = accelerator.skip_first_batches(train_loader, batch_skips)  # skip step in epoch
                 skip_iterator = iter(skip_loader)
             logger.info(f"Resuming training at step {update_step} (epoch {epoch}) (training time {time.strftime('%H:%M:%S', time.gmtime(prev_training_time))})")
-            
+
         except Exception as e:
             logger.info(f"Failed to load checkpoint metadata: {checkpoint_path} resetting training state")
             logger.info(f"Error: {e}")
             raise e
+
+    elif log_step > 0 and log_step < len(train_loader) and update_step == 0:
+        # if were starting a run from a saved checkpoints like embeddings and we want to skip the batches used to train during that phase
+        # however we only do this if we are during the first epoch, otherwise we just start over from the next epoch
+        # also we only do this when starting, as on a preemption the saved checkpoint steps will be correct
+        epoch_step = log_step + 1 # start from log_step + 1
+        batch_skips = int((epoch_step - 1)*gradient_accumulation_steps)
+        if batch_skips >= len(train_loader):
+            logger.info(f"SHOULD NEVER GET HERE")
+            epoch_step = -1
+        else:
+            logger.info(f"Skipping {batch_skips} batches (per loader) as those were already seen during the training phase")
+            skip_loader = accelerator.skip_first_batches(train_loader, batch_skips)  # skip step in epoch
+            skip_iterator = iter(skip_loader)
 
     logger.debug(f"Accelerator state: {accelerator.state}")
     training_iterator = iter(train_loader)
@@ -1051,7 +1063,11 @@ def main(args):
         "eval_iters": args.eval_iters,
         "experiment": args.experiment_name,
         "save_results": args.save_results,
-        "save_results_dir": hashed_file_name
+        "save_results_dir": hashed_file_name,
+        "do_sample": args.do_sample,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
     }
 
     eval_config["tokenizer"] = tokenizer
@@ -1095,8 +1111,7 @@ def main(args):
     start_time = time.time()
     training_time = 0
     use_progress_bar = True
-    eval_at_start = True
-    log_step = args.log_step + update_step  # start logging at the step specified by the log_step arg + the step number of the checkpoint
+    eval_at_start = True  # TODO make configurable
     
     progress_bar = tqdm(
         range(total_gradient_updates),
@@ -1319,6 +1334,9 @@ def main(args):
                 old_embeddings_norm = calculate_norm(old_embeddings_weights_prestep - old_embeddings_weights_poststep)
                 del old_embeddings_weights_prestep, old_embeddings_weights_poststep
 
+                memeory_before_zero_grad = torch.cuda.memory_allocated() / 1024**2
+                logger.debug(f"Memory before zero grad - Device {accelerator.process_index}: {memeory_before_zero_grad:.2f} MB", main_process_only=False)
+
                 optim.zero_grad()
                 memory_after_grad_step = torch.cuda.memory_allocated() / 1024**2
                 logger.debug(f"Memory after grad step - Device {accelerator.process_index}: {memory_after_grad_step:.2f} MB", main_process_only=False)
@@ -1514,9 +1532,9 @@ def main(args):
     if save_checkpoints_type is not None:
         logger.info(f"Preparing to save model to {output_dir}")
         
-        if not check_disk_space(output_dir, required_space_gb=20):
-            logger.info("Aborting save due to insufficient disk space")
-            return
+        # if not check_disk_space(output_dir, required_space_gb=20):
+        #     logger.info("Aborting save due to insufficient disk space")
+        #     return
 
         unwrapped_model = accelerator.unwrap_model(model)
         if isinstance(unwrapped_model, PeftModel):
@@ -1524,12 +1542,32 @@ def main(args):
             unwrapped_model = unwrapped_model.merge_and_unload()  # merges LoRA offsets into the backbone
         
         logger.info(f"Saving Final model to {output_dir_path}")
-        unwrapped_model.save_pretrained(
-            output_dir_path,
-            is_main_process=accelerator.is_main_process,
-            save_function=accelerator.save,
-            # state_dict=state_dict,
-        )
+        saved_embeddings = False
+        if finetune_embeddings_params_only:
+            if accelerator.is_main_process:
+                try:
+                    os.makedirs(output_dir_path, exist_ok=True)
+                    logger.info("Saving only input and output embeddings")
+                    embeddings_path = os.path.join(output_dir_path, "embeddings_only.pt")
+                    torch.save({
+                        "input_embeddings": unwrapped_model.get_input_embeddings().weight.detach().cpu(),
+                        "output_embeddings": unwrapped_model.get_output_embeddings().weight.detach().cpu(),
+                    }, embeddings_path)
+                    saved_embeddings = True
+                except Exception as e:
+                    logger.error(f"Failed to save embeddings: {e}")
+                    saved_embeddings = False
+            accelerator.wait_for_everyone()
+
+        if not saved_embeddings:
+            logger.info("Saving full model")
+            unwrapped_model.save_pretrained(
+                output_dir_path,
+                is_main_process=accelerator.is_main_process,
+                save_function=accelerator.save,
+                # state_dict=state_dict,
+            )
+            unwrapped_model.config.save_pretrained(output_dir_path, is_main_process=accelerator.is_main_process, save_function=accelerator.save)
 
         success = True
         if accelerator.is_main_process:
@@ -1577,7 +1615,7 @@ def main(args):
     if accelerator.is_main_process:
         lm_eval_string = get_lm_eval_string(output_dir_path, 
                                             tokenizer.name_or_path, 
-                                            base_tokenizer_path=args.original_model,
+                                            original_model_path=args.original_model,
                                             tasks=eval_config["benchmark_tasks"],
                                             # num_fewshot=eval_config["num_fewshot"],
                                             # limit=eval_config["limit"],
@@ -1585,6 +1623,11 @@ def main(args):
                                             # cache_requests=eval_config["cache_requests"],
                                             # show_config=eval_config["show_config"],
                                             experiment = args.experiment_name,
+                                            do_sample=eval_config.get("do_sample", False),
+                                            temperature=eval_config.get("temperature", None),
+                                            top_p=eval_config.get("top_p", None),
+                                            top_k=eval_config.get("top_k", None),
+                                            finetune_embeddings_params_only=saved_embeddings,
                                             )
         
         with open(os.path.join(output_dir, "lm_eval.sh"), "w") as f:

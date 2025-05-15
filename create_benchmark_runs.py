@@ -26,6 +26,8 @@ if __name__ == "__main__":
     args.add_argument("--show_config", type=bool, default=False)
     args.add_argument("--train_run_file", type=str)
     args.add_argument("--include_baseline", type=bool, default=True)
+    args.add_argument("--main_process_port", action="store_true")
+    args.add_argument("--num_processes", type=int, default=8)
     args = args.parse_args()
 
     output_bash_file = os.path.join(args.scripts_dir, args.output_bash_file)
@@ -48,6 +50,7 @@ if __name__ == "__main__":
             experiment_file_name = args.train_run_file.split("/")[-1]
             shutil.copy2(source_script_name, os.path.join(output_folder, experiment_file_name))
     
+    missing_list, process_port = compile_eval_scripts(output_run_list, output_bash_file, title = source_script_name, main_process_port = args.main_process_port, num_processes = args.num_processes)
     if args.include_baseline and len(file_args_list) > 0:
         print(f"Adding baseline model")
         baseline_file_args = file_args_list[0]
@@ -55,9 +58,9 @@ if __name__ == "__main__":
         base_line_string = add_baseline_lm_eval(baseline_file_args, baseline_pre_args)
         print(base_line_string)
         with open(output_bash_file, "a") as f:
+            if process_port is not None:
+                base_line_string = base_line_string.replace("--num_processes 8", f"--num_processes {args.num_processes} --main_process_port {process_port}")
             f.write(base_line_string + "\n")
-
-    missing_list = compile_eval_scripts(output_run_list, output_bash_file, title = source_script_name)
 
     with open(output_bash_file, "a") as f:
         for missing_dir in missing_list:

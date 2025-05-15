@@ -1,6 +1,6 @@
 import logging
 
-from efficient_tokenization.tokenize_simple import my_tokenize, get_genqa_data, get_tokenizer, get_magpie_data, apply_chat_template, create_translation_dataset_with_template
+from efficient_tokenization.tokenize_simple import my_tokenize, get_genqa_data, get_tokenizer, get_magpie_data, apply_chat_template, create_translation_dataset_with_template, get_gsm8k_data, get_mbpp_data
 from datasets import load_from_disk, concatenate_datasets
 from transformers import AutoTokenizer
 import copy
@@ -31,6 +31,10 @@ def get_preprocessed_data(ds, args):
         ds = get_genqa_data(ds, track_role=True, batch_size=args.cpu_batch_size, threads=args.num_proc)
     elif args.raw_data_name == "magpie":
         ds = get_magpie_data(ds, track_role=True, batch_size=args.cpu_batch_size, threads=args.num_proc)
+    elif args.raw_data_name == "gsm8k":
+        ds = get_gsm8k_data(ds, track_role=True, batch_size=args.cpu_batch_size, threads=args.num_proc)
+    elif args.raw_data_name == "mbpp":
+        ds = get_mbpp_data(ds, track_role=True, batch_size=args.cpu_batch_size, threads=args.num_proc)
     else:
         raise ValueError(f"Unsupported raw data name: {args.raw_data_name}")
     return ds
@@ -177,7 +181,10 @@ def main(args):
     ds = load_from_disk(dataset_path)
 
     if args.dry_run:
-        ds = ds.select(range(100))
+        try:
+            ds = ds.select(range(100))
+        except:
+            ds = ds["train"].select(range(100))
     
     print(ds)
     ds = get_preprocessed_data(ds, args)
@@ -186,21 +193,21 @@ def main(args):
     # this block is the only thing that is dataset specific
     ds_dict = {}
     if "default" in args.task:
-        ds_dict["default"] = apply_chat_template(ds, tokenizer, args.cpu_batch_size, args.num_proc)
-        print(visualize_loss_mask(ds_dict["default"]["input_ids"][0], ds_dict["default"]["loss_mask"][0], tokenizer))
+        ds_dict["default"] = apply_chat_template(ds, tokenizer, args.cpu_batch_size, args.num_proc, args.chat_template_name)
+        print(visualize_loss_mask(ds_dict["default"]["input_ids"][0], tokenizer, ds_dict["default"]["loss_mask"][0]))
 
     if "translation" in args.task:
         if base_tokenizer is None:
             base_tokenizer = AutoTokenizer.from_pretrained(args.model)
-        ds_dict["translation"] = create_translation_dataset_with_template(ds, base_tokenizer, tokenizer, args.cpu_batch_size, args.num_proc)
+        ds_dict["translation"] = create_translation_dataset_with_template(ds, base_tokenizer, tokenizer, args.cpu_batch_size, args.num_proc, args.chat_template_name)
 
-        print(visualize_loss_mask(ds_dict["translation"]["input_ids"][0], ds_dict["translation"]["loss_mask"][0], tokenizer))
+        print(visualize_loss_mask(ds_dict["translation"]["input_ids"][0], tokenizer, ds_dict["translation"]["loss_mask"][0]))
 
     changed_dataset = False
     final_ds_list = []
 
     for task_name in ds_dict:
-        dataset_path = os.path.join(args.save_dataset_dir, f"{args.raw_data_name}-{task_name}-{args.save_dataset_name}")
+        dataset_path = os.path.join(args.save_dataset_dir, f"{args.raw_data_name}-{task_name}-{args.chat_template_name}-{args.save_dataset_name}")
         if os.path.exists(dataset_path):
             logger.info(f"Dataset already exists, skipping: {dataset_path}")
             continue
@@ -252,7 +259,7 @@ if __name__ == "__main__":
         threads = os.cpu_count()
 
     args = argparse.ArgumentParser()
-    args.add_argument("--cpu-batch-size", type=int, default=1000)
+    args.add_argument("--cpu-batch-size", type=int, default=10)
     args.add_argument("--seed", type=int, default=42)
     args.add_argument("--model", type=str,
                       default="meta-llama/Llama-3.2-1B")
@@ -264,6 +271,7 @@ if __name__ == "__main__":
     args.add_argument("--save-dataset-dir", type=str, default="datasets")
     args.add_argument("--tokenizer-path", type=str)
     args.add_argument("--pretokenizer-name", type=str)
+    args.add_argument("--chat-template-name", type=str, default="llama32", choices=["llama32", "phi", "qwen"])
     args.add_argument("--force-tokenize", action="store_true")
     args.add_argument("--task", type=str, default="default")
     args.add_argument("--dry-run", action="store_true")

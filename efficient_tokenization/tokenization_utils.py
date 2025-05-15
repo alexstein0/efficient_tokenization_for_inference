@@ -318,7 +318,7 @@ class SaveModule:
 
         self.save(merges=new_merges, dataset_sizes=new_dataset_sizes, additional_info=additional_info, ranks=new_ranks, num_added_tokens=num_new_tokens, with_added_tokens=added_tokens)
 
-    def save(self, merges: List[Tuple[bytes, bytes]], dataset_sizes: List[int], additional_info: Dict[str, Any] = {}, ranks: Dict[bytes, int] = None, num_added_tokens: int = None, with_added_tokens: bool = False):
+    def save(self, merges: List[Tuple[bytes, bytes]], dataset_sizes: List[int], additional_info: Dict[str, Any] = {}, ranks: Dict[bytes, int] = None, num_added_tokens: int = None, with_added_tokens: bool = False, save_ext: str = None):
         new_added_tokens = get_new_added_tokens(new_merges=merges, new_mergeable_ranks=ranks)
         if ranks is not None:
             num_added_tokens = len(ranks) - self.initial_vocab_size
@@ -338,16 +338,20 @@ class SaveModule:
             # "old_tokenzer_info": old_tokenizer_info
             "compression_rate": compression_rate
         }
-        self.static_info["save_path"] = self.save_loc
+        save_loc = self.save_loc
+        if save_ext is not None:
+            save_loc = f"{save_loc}-{save_ext}"
+            
+        self.static_info["save_path"] = save_loc
         training_info = {"static_info": self.static_info, **additional_info, **new_training_info}
 
         if self.original_tokenizer is not None:
             # will never be none, better check wll be f we allow the .model files to be used
-            save_tokenizer_new(training_info, self.save_loc, self.original_tokenizer, pretok_override=self.pretokenizer, with_added_tokens=with_added_tokens)
+            save_tokenizer_new(training_info, save_loc, self.original_tokenizer, pretok_override=self.pretokenizer, with_added_tokens=with_added_tokens)
         else:
-            save_tokenizer(training_info, self.save_loc)
+            save_tokenizer(training_info, save_loc)
 
-        save_training_info(training_info, self.save_loc)
+        save_training_info(training_info, save_loc)
 
 
 
