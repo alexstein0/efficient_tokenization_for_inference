@@ -61,9 +61,8 @@ from efficient_tokenization.model_utils import (
 from efficient_tokenization.benchmarking_utils import get_lm_eval_string, convert_results_into_new_token_metrics
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 
-
-from lm_eval import evaluator, tasks, utils, models
-from lm_eval.tasks import TaskManager
+from lm_eval_harness.lm_eval import evaluator, utils, models
+from lm_eval_harness.lm_eval.tasks import TaskManager
 
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
