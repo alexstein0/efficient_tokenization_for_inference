@@ -4,8 +4,18 @@ from transformers.tokenization_utils_base import BatchEncoding, TensorType, Padd
 from transformers.utils.chat_template_utils import _compile_jinja_template, _render_with_assistant_indices
 import json
 import os
+import random
 
-
+def get_system_prompt(chat_template_name: str) -> str:
+    if chat_template_name == "qwen":
+        return "You are a helpful assistant."
+    elif chat_template_name == "phi":
+        return 'Your name is Phi, an AI math expert developed by Microsoft.'
+    elif chat_template_name == "llama32":
+        return "You are a helpful assistant."
+    else:
+        raise ValueError(f"Unknown chat template: {chat_template_name}")
+    
 def get_qwen_chat_template() -> str:
     template = """{%- if tools %}
 <|im_start|>system
@@ -116,15 +126,17 @@ For each function call, return a json object with function name and arguments wi
 
 
 def get_qwen_repeat_chat_template() -> str:
-    template = """<|im_start|>system
-You are a helpful assistant who repeats the given question and answer exactly as given but as short as possible.<|im_end|>
-{% for message in messages %}<|im_start|>{{ message.role }}
+    # system should be first but isnt special
+    template = """{% for message in messages %}<|im_start|>{{ message.role }}
 {% if message.role == "assistant" %}
 {% generation %}
 {{ message.content }}
 {% endgeneration %}
 {% else %}
 {{ message.content }}
+{% endif %}
+{% if message.role == "system" %}
+'\\n\\n'
 {% endif %}
 <|im_end|>
 {% endfor %}
@@ -138,6 +150,8 @@ You are a helpful assistant who repeats the given question and answer exactly as
   {%- endif %}
 {%- endif %}"""
     return template
+
+
 def get_phi_cot_chat_template() -> str:
     template = """{{ '<|system|>Your name is Phi, an AI math expert developed by Microsoft.' }}
 {% for message in messages %}
@@ -164,7 +178,9 @@ def get_phi_cot_chat_template() -> str:
 def get_phi_chat_template_repeat() -> str:
     template = """{{ '<|system|>Your name is Phi, an AI math expert developed by Microsoft.' }}
 {% for message in messages %}
-    {% if message['role'] == 'user' %}
+    {% if message['role'] == 'system' %}
+        {{ message['content'] + '<|end|>' }}
+    {% elif message['role'] == 'user' %}
         {{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}
     {% elif message['role'] == 'assistant' %}
         {% generation %}
@@ -293,10 +309,8 @@ def get_llama32_instruct_chat_template_minimal() -> str:
     return ''.join(line.strip() for line in template.splitlines())
 
 def get_llama32_repeat_chat_template() -> str:
-    template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-You are a helpful assistant who repeats the given question and answer exactly.<|eot_id|>{% for message in messages %}<|start_header_id|>{{ message.role }}<|end_header_id|>
-
+    template = """<|begin_of_text|>
+{% for message in messages %}<|start_header_id|>{{ message.role }}<|end_header_id|>
 {% if message.role == "assistant" %}
 {% generation %}
 {{ message.content }}
@@ -309,10 +323,162 @@ You are a helpful assistant who repeats the given question and answer exactly.<|
 {% generation %} {% endgeneration %}<|eot_id|>{% endif %}"""
     return ''.join(line.strip() for line in template.splitlines())
 
+# def get_dictionary_chat_template() -> str:
+#     template = """{{ bos_token }}<|system|>{{ system_message }}
+# {% for message in messages %}
+# <|{{ message['role'] }}|>
+# {{ message['content'].strip() }}
+# {% endfor %}
+# {% if add_generation_prompt %}<|assistant|>
+# <|assistant|>
+# """
+
+# {{- "<|start_header_id|>system<|end_header_id|>\n\n" }}
+# {%- if tools is not none %}
+#     {{- "Environment: ipython\n" }}
+# {%- endif %}
+# {{- "Cutting Knowledge Date: December 2023\n" }}
+# {{- "Today Date: " + date_string + "\n\n" }}
+# {%- if tools is not none and not tools_in_user_message %}
+#     {{- "You have access to the following functions. To call a function, please respond with JSON for a function call." }}
+#     {{- 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.' }}
+#     {{- "Do not use variables.\n\n" }}
+#     {%- for t in tools %}
+#         {{- t | tojson(indent=4) }}
+#         {{- "\n\n" }}
+#     {%- endfor %}
+# {%- endif %}
+# {{- system_message }}
+# {{- "<|eot_id|>" }}
+
+def get_llama32_dictionary_chat_template() -> str:
+    template = """{{ bos_token }}
+    {%- if not date_string is defined %}
+        {%- if strftime_now is defined %}
+            {%- set date_string = strftime_now(\"%d %b %Y\") %}
+        {%- else %}
+            {%- set date_string = \"15 May 2025\" %}
+        {%- endif %}
+    {%- endif %}
+{% for message in messages %}
+    {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' }}
+    {% if message['role'] == 'system' %}
+        {{- \"Cutting Knowledge Date: December 2023\\n\" }}\n{{- \"Today Date: \" + date_string + \"\\n\\n\" }}\n
+        {{ message.content }}<|eot_id|>
+    {% elif message['role'] == 'user' %}
+        {% generation %}
+            {{ message.content }}
+        {% endgeneration %}
+        <|eot_id|>
+    {% elif message['role'] == 'assistant' %}
+        {% generation %}
+            {{ message.content }}<|eot_id|>
+        {% endgeneration %}
+    {% endif %}\n
+{% endfor %}
+"""
+    return ''.join(line.strip() for line in template.splitlines())
+
+def convert_to_repeat_chat(chat: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Convert a chat to a repeat chat.
+    """
+    output = []
+    if len(chat) == 3:
+        assert chat[0]["role"] == "system", f"First message must be a system message, got {chat[0]['role']}"
+        output.append({"role": "system", "content": chat[0]["content"]})
+        chat = chat[1:]
+
+    assert len(chat) == 2, f"Chat must have exactly 2 messages, got {len(chat)}"
+    assert chat[0]["role"] == "user", f"First message must be a user message, got {chat[0]['role']}"
+    assert chat[1]["role"] == "assistant", f"Second message must be an assistant message, got {chat[1]['role']}"
+    assert isinstance(chat[0]['content'], List), f"First message must be a List, got {type(chat[0]['content'])}"
+    sentence = f"Question: {chat[0]['content']} Answer: {chat[1]['content']}"
+    return [{"role": "user", "content": sentence}, {"role": "assistant", "content": sentence}]
+
+
+def convert_to_dictionary_chat(dictionary_sample: List[Dict[str, Any]], tokenizer: AutoTokenizer, system_message: str = ""):
+    """
+    Convert a chat to a dictionary task chat.
+    The data will be a list of dictionaries, each with the following keys:
+    - old_tokens: List[int]
+    - new_token: int
+    - token_id: int
+    - merge_ids: List[int]
+    There will be any number of these dictionaries, and the system message will be prepended to the conversation.
+    # TODO think about if there should be a delimiter between different words
+    """
+    first_token_str = []
+    second_token_str = []
+    first_token_list = []
+    second_token_list = []
+    first_token_loss_mask = []
+    second_token_loss_mask = []
+    quote_char = "'"
+    comma_char = ","
+    quote_id = tokenizer.convert_tokens_to_ids([quote_char])[0]
+    comma_id = tokenizer.convert_tokens_to_ids([comma_char])[0]
+    for dict_entry in dictionary_sample:
+            
+        old_token = dict_entry["old_tokens"]
+        new_token = dict_entry["new_token"]
+        token_id = dict_entry["token_id"]
+        merge_ids = dict_entry["merge_ids"]
+        merge_len = len(merge_ids)
+        new_token_str = f"{quote_char}{new_token}{quote_char}"
+        if old_token is not None:
+            # TODO hacky way to handle None
+            old_token_str = f"{quote_char}{''.join(old_token)}{quote_char}"
+        else:
+            old_token_str = new_token_str
+        assert new_token_str == old_token_str, f"New word must equal old word in string space, got {new_token_str} and {old_token_str}"
+
+        new_token_list = [quote_id, token_id, quote_id]
+        old_token_list = [quote_id, *merge_ids, quote_id]
+        new_token_mask = [0, 1, 0]
+        old_token_mask = [0, *[1] * merge_len, 0]
+
+        randomize_order = True
+        if randomize_order and random.random() > 0.5:
+            first_token_str.append(new_token_str)
+            second_token_str.append(old_token_str)
+            first_token_list.append(new_token_list)
+            second_token_list.append(old_token_list)
+            first_token_loss_mask.append(new_token_mask)
+            second_token_loss_mask.append(old_token_mask)
+        else:
+            first_token_str.append(old_token_str)
+            second_token_str.append(new_token_str)
+            first_token_list.append(old_token_list)
+            second_token_list.append(new_token_list)
+            first_token_loss_mask.append(old_token_mask)
+            second_token_loss_mask.append(new_token_mask)
+
+    full_first_token_str = comma_char.join(first_token_str)
+    full_second_token_str = comma_char.join(second_token_str)
+    assert full_first_token_str == full_second_token_str, f"First token string must equal second token string, got {full_first_token_str} and {full_second_token_str}"
+    for old, new, old_loss, new_loss in zip(second_token_list[:-1], first_token_list[:-1], first_token_loss_mask[:-1], second_token_loss_mask[:-1]):
+        old.append(comma_id)
+        new.append(comma_id)
+        old_loss.append(0)
+        new_loss.append(0)
+        # assert old == new, f"Old token list must equal new token list, got {old} and {new}"
+    
+    output = []
+    output.append({"role": "system", "content": system_message})
+
+    user_content = f"Repeat the following:"
+    # assistant_content = f"\'{new_token_str[0]}\'"
+    output.append({"role": "user", "content": user_content})
+    output.append({"role": "assistant", "content": ""})
+    return output, full_first_token_str, first_token_list, second_token_list, first_token_loss_mask, second_token_loss_mask
+    
+
+
 def apply_chat_template_normal(
     tokenizer: AutoTokenizer,
     conversation: Union[List[Dict[str, str]], List[List[Dict[str, str]]]],
-    chat_template: Optional[str] = None,
+    chat_template_name: Optional[str] = None,
     add_generation_prompt: bool = False,
     return_assistant_tokens_mask: bool = False,
     tokenize: bool = True,
@@ -330,8 +496,16 @@ def apply_chat_template_normal(
     if tokenizer_kwargs is None:
         tokenizer_kwargs = {}
 
-    if chat_template is None:
+    if chat_template_name is None:
         chat_template = get_llama32_instruct_chat_template()
+    elif chat_template_name == "llama32":
+        chat_template = get_llama32_instruct_chat_template()
+    elif chat_template_name == "phi":
+        chat_template = get_phi_cot_chat_template()
+    elif chat_template_name == "qwen":
+        chat_template = get_qwen_chat_template()
+    else:
+        raise ValueError(f"Chat template name {chat_template_name} not found")
 
     compiled_template = _compile_jinja_template(chat_template)
 
@@ -348,8 +522,7 @@ def apply_chat_template_normal(
     for chat in conversations:
         # TODO better handle system message
         if add_system_message and "system" not in [m["role"] for m in chat]:
-            DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
-            chat = [{"role": "system", "content": DEFAULT_SYSTEM_MESSAGE}] + chat
+            chat = [{"role": "system", "content": get_system_prompt(chat_template_name)}] + chat
 
         if return_assistant_tokens_mask:
             rendered_chat, generation_indices = _render_with_assistant_indices(
@@ -386,6 +559,7 @@ def apply_chat_template_normal(
         return_tensors=return_tensors,
         **tokenizer_kwargs,
     )
+    out["text"] = rendered
 
     if return_assistant_tokens_mask:
         assistant_masks = []
@@ -417,28 +591,16 @@ def apply_chat_template_normal(
 
     return out
 
-def convert_to_repeat_chat(chat: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Convert a chat to a repeat chat.
-    """
-    if len(chat) == 3:
-        assert chat[0]["role"] == "system", f"First message must be a system message, got {chat[0]['role']}"
-        chat = chat[1:]
-
-    assert len(chat) == 2, f"Chat must have exactly 2 messages, got {len(chat)}"
-    assert chat[0]["role"] == "user", f"First message must be a user message, got {chat[0]['role']}"
-    assert chat[1]["role"] == "assistant", f"Second message must be an assistant message, got {chat[1]['role']}"
-    sentence = f"Question: {chat[0]['content']} Answer: {chat[1]['content']}"
-    return [{"role": "user", "content": sentence}, {"role": "assistant", "content": sentence}]
 
 def apply_chat_template_repeat(
     base_tokenizer: AutoTokenizer,
     second_tokenizer: AutoTokenizer,
     conversation: Union[List[Dict[str, str]], List[List[Dict[str, str]]]],
-    chat_template: Optional[str] = None,
+    chat_template_name: Optional[str] = None,
     add_generation_prompt: bool = False,
     return_tensors: Optional[Union[str, TensorType]] = None,
     tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+    add_system_message: bool = True,
 ) -> Dict[str, Any]:
     """
     Special repeat-task templating (two-tokenizer case), supports batching.
@@ -446,10 +608,20 @@ def apply_chat_template_repeat(
     if tokenizer_kwargs is None:
         tokenizer_kwargs = {}
 
-    if chat_template is None:
+    if chat_template_name is None:
         chat_template = get_llama32_repeat_chat_template()
+    elif chat_template_name == "llama32":
+        chat_template = get_llama32_repeat_chat_template()
+    elif chat_template_name == "phi":
+        chat_template = get_phi_chat_template_repeat()
+    elif chat_template_name == "qwen":
+        chat_template = get_qwen_repeat_chat_template()
+    else:
+        raise ValueError(f"Chat template name {chat_template_name} not found")
+
 
     compiled_template = _compile_jinja_template(chat_template)
+    DEFAULT_REPEAT_SYSTEM_MESSAGE = "You are a helpful assistant who repeats the given question and answer exactly as given but as short as possible"
 
     if isinstance(conversation, (list, tuple)) and isinstance(conversation[0], dict):
         conversations = [conversation]
@@ -465,6 +637,9 @@ def apply_chat_template_repeat(
     texts = []
 
     for chat in conversations:
+        if add_system_message and "system" not in [m["role"] for m in chat]:
+            chat = [{"role": "system", "content": DEFAULT_REPEAT_SYSTEM_MESSAGE}] + chat
+
         chat_repeated = convert_to_repeat_chat(chat)
         rendered_chat, generation_indices = _render_with_assistant_indices(
             compiled_template=compiled_template,
@@ -533,6 +708,141 @@ def apply_chat_template_repeat(
         "text": texts,
     }
 
+def apply_chat_template_dictionary(
+    base_tokenizer: AutoTokenizer,
+    second_tokenizer: AutoTokenizer,
+    conversation: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
+    chat_template_name: Optional[str] = None,
+    add_generation_prompt: bool = False,
+    return_tensors: Optional[Union[str, TensorType]] = None,
+    tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+    add_system_message: bool = True,
+) -> Dict[str, Any]:
+    """
+    Special repeat-task templating (two-tokenizer case), supports batching.
+    """
+    if tokenizer_kwargs is None:
+        tokenizer_kwargs = {}
+
+    # Right now use the repeat template, which is just a generic template for each model.  the important thing is the "convert to dictionary" function
+    if chat_template_name is None:
+        chat_template = get_llama32_dictionary_chat_template()
+    elif chat_template_name == "llama32":
+        chat_template = get_llama32_dictionary_chat_template()
+    elif chat_template_name == "phi":
+        chat_template = get_phi_dictionary_chat_template()
+    elif chat_template_name == "qwen":
+        chat_template = get_qwen_dictionary_chat_template()
+    else:
+        raise ValueError(f"Chat template name {chat_template_name} not found")
+    
+
+    system_message = get_system_prompt(chat_template_name)
+    compiled_template = _compile_jinja_template(chat_template)
+
+    input_ids_list = []
+    attention_mask_list = []
+    labels_list = []
+    loss_mask_list = []
+    texts = []
+
+    for chat in conversation:
+
+        dictionary_chat, raw_string, old_token_ids, new_token_ids, old_token_loss_mask, new_token_loss_mask = convert_to_dictionary_chat(chat, second_tokenizer, system_message)
+
+        rendered_chat, generation_indices = _render_with_assistant_indices(
+            compiled_template=compiled_template,
+            messages=dictionary_chat,
+            tools=None,
+            documents=None,
+            add_generation_prompt=add_generation_prompt,
+            **base_tokenizer.special_tokens_map,
+        )
+
+        assert len(generation_indices) == 2, f"Generation indices must be a list length 2, got {generation_indices}"
+
+        first_gen, first_gen_end = generation_indices[0]
+        second_gen, second_gen_end = generation_indices[1]
+
+        # if len(system_message) == 0:
+        #     assert first_gen == first_gen_end, f"Generation indices must be the same"
+            
+        # assert second_gen == second_gen_end, f"Generation indices must be the same"
+        
+        beginning_text = rendered_chat[:first_gen]
+        first_generation_text = rendered_chat[first_gen:first_gen_end]
+        between_text = rendered_chat[first_gen_end:second_gen]
+        second_generation_text = rendered_chat[second_gen:second_gen_end]
+        end_text = rendered_chat[second_gen_end:]
+
+        out_beginning = base_tokenizer(beginning_text, add_special_tokens=False, return_tensors=return_tensors, **tokenizer_kwargs)
+        out_first_generation = base_tokenizer(first_generation_text, add_special_tokens=False, return_tensors=return_tensors, **tokenizer_kwargs)
+        out_between = base_tokenizer(between_text, add_special_tokens=False, return_tensors=return_tensors, **tokenizer_kwargs)
+        out_second_generation = base_tokenizer(second_generation_text, add_special_tokens=False, return_tensors=return_tensors, **tokenizer_kwargs)
+        out_end = base_tokenizer(end_text, add_special_tokens=False, return_tensors=return_tensors, **tokenizer_kwargs)
+
+        # if randomize_order:
+        first_token_ids = old_token_ids
+        second_token_ids = new_token_ids
+        first_token_loss_mask = old_token_loss_mask
+        second_token_loss_mask = new_token_loss_mask
+
+        # Concatenate input_ids and attention_mask
+        full_rendered_text = beginning_text + first_generation_text + raw_string + between_text + raw_string + second_generation_text + end_text
+        input_ids = (
+            out_beginning["input_ids"] + 
+            out_first_generation["input_ids"] +
+            [x for sublist in first_token_ids for x in sublist] + 
+            out_between["input_ids"] +
+            [x for sublist in second_token_ids for x in sublist] + 
+            out_second_generation["input_ids"] +
+            out_end["input_ids"]
+            )
+        attention_mask = (
+            out_beginning["attention_mask"] + 
+            out_first_generation["attention_mask"] +
+            [1 for sublist in first_token_ids for _ in sublist] + 
+            out_between["attention_mask"] + 
+            [1 for sublist in second_token_ids for _ in sublist] + 
+            out_second_generation["attention_mask"] +
+            out_end["attention_mask"]
+            )
+        labels = input_ids.copy()
+        track_old_words = False
+        loss_mask = (
+            [0] * len(out_beginning["input_ids"]) +
+            [0] * len(out_first_generation["input_ids"]) +
+            [(x if track_old_words else 0) for sublist in first_token_loss_mask for x in sublist] +
+            [0] * len(out_between["input_ids"]) +
+            [x for sublist in second_token_loss_mask for x in sublist] +
+            [1] * len(out_second_generation["input_ids"]) +
+            [0] * len(out_end["input_ids"])
+        )
+        assert len(loss_mask) == len(input_ids), f"Loss mask must be the same length as input ids, got {len(loss_mask)} and {len(input_ids)}"
+        assert len(attention_mask) == len(input_ids), f"Attention mask must be the same length as input ids, got {len(attention_mask)} and {len(input_ids)}"
+        assert len(labels) == len(input_ids), f"Labels must be the same length as input ids, got {len(labels)} and {len(input_ids)}"
+
+        input_ids_list.append(input_ids)
+        attention_mask_list.append(attention_mask)
+        labels_list.append(labels)
+        loss_mask_list.append(loss_mask)
+        texts.append(full_rendered_text)
+
+    if return_tensors == "pt":
+        import torch
+        input_ids_list = torch.nn.utils.rnn.pad_sequence([torch.tensor(ids) for ids in input_ids_list], batch_first=True, padding_value=base_tokenizer.pad_token_id)
+        attention_mask_list = torch.nn.utils.rnn.pad_sequence([torch.tensor(mask) for mask in attention_mask_list], batch_first=True, padding_value=0)
+        labels_list = torch.nn.utils.rnn.pad_sequence([torch.tensor(lbls) for lbls in labels_list], batch_first=True, padding_value=-100)
+        loss_mask_list = torch.nn.utils.rnn.pad_sequence([torch.tensor(mask) for mask in loss_mask_list], batch_first=True, padding_value=0)
+
+    return {
+        "input_ids": input_ids_list,
+        "attention_mask": attention_mask_list,
+        "labels": labels_list,
+        "loss_mask": loss_mask_list,
+        "text": texts,
+    }
+
 def build_loss_mask_from_roles(
     input_ids_list,
     tokenized_texts: List[str],
@@ -581,35 +891,6 @@ def build_loss_mask_from_roles(
         assistant_masks.append(mask)
 
     return assistant_masks
-
-# def visualize_loss_mask_old(input_ids, tokenizer, loss_mask=None):
-#     """
-#     Visualize the loss-masked parts of a tokenized sample with color highlighting and show token IDs.
-
-#     Args:
-#         input_ids (List[int] or Tensor): tokenized input ids
-#         loss_mask (List[int]): mask where 1 = assistant tokens to supervise
-#         tokenizer (AutoTokenizer): tokenizer for decoding
-#     Returns:
-#         str: visualization string
-#     """
-#     if loss_mask is None:
-#         loss_mask = [1] * len(input_ids)
-
-#     tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
-#     output = []
-#     for token, token_id, mask in zip(tokens, input_ids, loss_mask):
-#         token_text = f"{token}"
-#         if token_id > 128000:
-#             token_id_text = f"\033[1;31m({token_id})\033[0m"  # White color otherwise
-#         else:
-#             token_id_text = f"\033[1;37m({token_id})\033[0m"  # Red color if ID > 128000
-#         if mask:
-#             # Highlight masked tokens (green background + black text)
-#             output.append(f"\033[1;30;42m {token_text} \033[0m{token_id_text}")
-#         else:
-#             output.append(f"{token_text}{token_id_text}")
-#     return " ".join(output)
 
 
 def visualize_loss_mask(input_ids, tokenizer, loss_mask=None, max_chars_per_line=200, new_token_id_threshold=128000):
@@ -714,8 +995,9 @@ def get_example_conversation(
     #     ]
     # ]
 
-    chat_template = get_qwen_chat_template()
-    chat_template_repeat = get_qwen_repeat_chat_template()
+    # chat_template = get_qwen_chat_template()
+    # chat_template_repeat = get_qwen_repeat_chat_template()
+    chat_template_name = "qwen"
 
     # --- NORMAL TEMPLATE EXAMPLE ---
     # print("\n=== NORMAL INSTRUCTION TEMPLATE ===")
@@ -727,7 +1009,7 @@ def get_example_conversation(
         # return_tensors="pt",
         # padding="longest",
         truncation=True,
-        chat_template=chat_template,
+        chat_template_name=chat_template_name,
     )
     
     # --- REPEAT TEMPLATE EXAMPLE ---
@@ -737,7 +1019,7 @@ def get_example_conversation(
         second_tokenizer=second_tokenizer,
         # conversation=repeat_conversation,
         conversation=normal_conversations,
-        chat_template=chat_template_repeat,
+        chat_template_name=chat_template_name,
         add_generation_prompt=False,
         # return_tensors="pt",
         # padding="longest",

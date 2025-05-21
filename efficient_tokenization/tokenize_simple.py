@@ -4,13 +4,16 @@ from transformers import PreTrainedTokenizerFast, AutoTokenizer
 from typing import Dict, List, Optional
 # import logging
 import psutil
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, Dataset
 import datasets
 datasets.disable_caching()
 # from chat_templating_old import apply_chat_template_to_repeat, get_llama_base_chat_template, get_llama_instruct_chat_template
-from chat_templating import apply_chat_template_repeat, apply_chat_template_normal, get_llama32_instruct_chat_template, get_llama32_repeat_chat_template, get_phi_chat_template_repeat, get_phi_cot_chat_template, get_qwen_chat_template, get_qwen_repeat_chat_template
+from chat_templating import apply_chat_template_repeat, apply_chat_template_normal, get_llama32_instruct_chat_template, get_phi_cot_chat_template, get_qwen_chat_template, apply_chat_template_dictionary
 import os
 import copy
+import random
+import numpy as np
+
 
 from datasets.utils.logging import disable_progress_bar
 disable_progress_bar()
@@ -88,15 +91,30 @@ def extract_mbpp(example_list: List[List[Dict[str, str]]], track_role: bool = Tr
         out_conversation = []
         test_str = ""
         for t in t_list:
-            test_str += f"{t}\n"
-        out_conversation.append({'role': "system", 'content': "You are an expert Python programmer."})
-        out_conversation.append({'role': "user", 'content': f"Here is your task: {q.strip()}" 
+            test_str += f"{t.strip()}\n"
+        # out_conversation.append({'role': "system", 'content': "You are an expert Python programmer."})
+        out_conversation.append({'role': "user", 'content': f"You are an expert Python programmer and here is your task: {q.strip()} " 
                                  + "Your code should pass these tests:\n\n"
                                  + test_str.strip()
                                  })
-        out_conversation.append({'role': "assistant", 'content': a.strip()})
+        out_conversation.append({'role': "assistant", 'content': f"\n[BEGIN]\n{a.strip()}\n[DONE]\n".strip()})
         output.append(out_conversation)
     return output
+
+def extract_dictionary_conversations(example_dict: Dict[str, List[List[Dict[str, str]]]]) -> Dict[str, List[List[Dict[str, str]]]]:
+    """
+    Extracts and concatenates user and assistant messages, encodes them into bytes.
+    """
+    output = []
+    old_tokens = example_dict["old_tokens"]
+    new_token = example_dict["new_token"]
+    for old_token, new_token in zip(old_tokens, new_token):
+        chat = []
+        # chat.append({"role": "system", "content": DEFAULT_REPEAT_SYSTEM_MESSAGE})
+        chat.append({"role": "user", "content": "|".join(old_token)})
+        chat.append({"role": "assistant", "content": new_token})
+        output.append(chat)
+    return {"text": output}
 
 
 def flatten_genqa_conversations(example: Dict[str, List[List[Dict[str, str]]]],
@@ -478,106 +496,14 @@ def init_tokenizer(tokenizer_path):
     extended_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
 
-# def create_translation_dataset(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int) -> datasets.Dataset:
-#     meta_prompt = """Repeat the following text: """
-#     meta_prompt_tok = base_tokenizer(meta_prompt)
-
-#     text1_label = "text1: "
-#     text1_label_tok = base_tokenizer(text1_label, add_special_tokens=False)
-#     text2_label = "text2: "
-#     text2_label_tok = base_tokenizer(text2_label, add_special_tokens=False)
-    
-#     def tokenize_function(examples):
-#         global extended_tokenizer
-#         batch_size = len(examples["text"])
-#         row_texts = list(examples["text"])
-        
-#         text_tok1 = base_tokenizer(row_texts, add_special_tokens=False)
-#         text_tok2 = extended_tokenizer(row_texts, add_special_tokens=False)
-        
-#         combined_text = []
-#         combined_input_ids = []
-#         combined_attention_mask = []
-#         combined_loss_mask = []
-        
-#         for i in range(batch_size):
-#             text = (meta_prompt + 
-#                     text1_label + 
-#                     row_texts[i] + 
-#                     text2_label +
-#                     row_texts[i]
-#                     )
-#             input_ids = (
-#                 meta_prompt_tok['input_ids'] + 
-#                 text1_label_tok['input_ids'] +
-#                 text_tok1['input_ids'][i] +
-#                 text2_label_tok['input_ids'] + 
-#                 text_tok2['input_ids'][i]
-#             )
-#             attention_mask = (
-#                 meta_prompt_tok['attention_mask'] + 
-#                 text1_label_tok['attention_mask'] +
-#                 text_tok1['attention_mask'][i] +
-#                 text2_label_tok['attention_mask'] +
-#                 text_tok2['attention_mask'][i]
-#             )
-#             mask_loss = (
-#                 [0 for _ in meta_prompt_tok['attention_mask']] + 
-#                 [0 for _ in text1_label_tok['attention_mask']] +
-#                 [0 for _ in text_tok1['attention_mask'][i]] +
-#                 [0 for _ in text2_label_tok['attention_mask']] +
-#                 [1 for _ in text_tok2['attention_mask'][i]]
-#             )
-            
-#             combined_text.append(text)
-#             combined_input_ids.append(input_ids)
-#             combined_attention_mask.append(attention_mask)
-#             combined_loss_mask.append(mask_loss)
-
-#         return {
-#             "text": combined_text,
-#             "input_ids": combined_input_ids,
-#             "attention_mask": combined_attention_mask,
-#             "labels": combined_input_ids.copy(),
-#             "loss_mask": combined_loss_mask,
-#         }
-
-#     if isinstance(tokenizer_input, str):
-#         # Initialize the tokenizer before mapping
-#         init_tokenizer(tokenizer_input)
-#     else:
-#         # When using an object, make it available globally
-#         global extended_tokenizer
-#         extended_tokenizer = tokenizer_input
-        
-#     tokenized_dataset = ds.map(
-#         tokenize_function,
-#         batched=True,
-#         batch_size=batch_size,
-#         num_proc=threads,
-#         remove_columns=ds.column_names,
-#         desc="Creating translation dataset",
-#         cache_file_name=None
-#     )
-    
-#     return tokenized_dataset
-
 def create_translation_dataset_with_template(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer_input: AutoTokenizer | str, batch_size: int, threads: int, chat_template_name: str = "llama32") -> datasets.Dataset:
-    if chat_template_name == "llama32":
-        chat_template = get_llama32_repeat_chat_template()
-    elif chat_template_name == "phi":
-        chat_template = get_phi_chat_template_repeat()
-    elif chat_template_name == "qwen":
-        chat_template = get_qwen_repeat_chat_template()
-    else:
-        raise ValueError(f"Chat template name {chat_template_name} not found")
     
     def tokenize_function(examples):
         tokenized_texts = apply_chat_template_repeat(
             base_tokenizer=base_tokenizer,
             second_tokenizer=tokenizer_input,
             conversation=examples["text"],
-            chat_template=chat_template,
+            chat_template_name=chat_template_name,
             # return_assistant_tokens_mask=True,
             add_generation_prompt=False,
             # return_tensors="pt",
@@ -604,17 +530,48 @@ def create_translation_dataset_with_template(ds: datasets.Dataset, base_tokenize
     
     return tokenized_dataset
 
+def create_dictionary_dataset(ds: datasets.Dataset, base_tokenizer: AutoTokenizer, tokenizer: AutoTokenizer, total_samples: int = 1000, min_words_per_sample: int = 5, max_words_per_sample: int = 15, chat_template_name: str = "llama32") -> datasets.Dataset:
+
+    def generate_samples(data, total_samples, min_words_per_sample, max_words_per_sample, weight_list = None):
+        samples = []
+        max_words_per_sample = min(max_words_per_sample, len(data))
+        min_words_per_sample = min(min_words_per_sample, max_words_per_sample)
+        if weight_list is not None:
+            sum_weights = sum(weight_list)
+            weight_list = [w / sum_weights for w in weight_list]
+        for _ in range(total_samples):
+            sample_size = random.randint(min_words_per_sample, max_words_per_sample)
+            if weight_list is None:
+                sample_ids = random.sample(data, k = sample_size)
+                samples.append(sample_ids)
+            else:
+                sample_indices = np.random.choice(len(data), size=sample_size, replace=False, p=weight_list)
+                sample = [data[i] for i in sample_indices]
+                samples.append(sample)
+        return samples
+
+    sampled_ds = generate_samples(ds.to_list(), total_samples=total_samples, min_words_per_sample=min_words_per_sample, max_words_per_sample=max_words_per_sample, weight_list=ds["weight"])
+    tokenized_dataset = apply_chat_template_dictionary(
+        base_tokenizer=base_tokenizer,
+        second_tokenizer=tokenizer,
+        conversation=sampled_ds,
+        chat_template_name=chat_template_name,
+    )
+
+    return Dataset.from_dict(tokenized_dataset)
+
+
 def apply_chat_template(ds: datasets.Dataset, tokenizer: AutoTokenizer, batch_size: int, threads: int, chat_template_name: str = "llama32", system_prompt: str = True) -> datasets.Dataset:
-    if chat_template_name == "llama32":
-        chat_template = get_llama32_instruct_chat_template()
-    elif chat_template_name == "phi":
-        chat_template = get_phi_cot_chat_template()
-        system_prompt = False
-    elif chat_template_name == "qwen":
-        chat_template = get_qwen_chat_template()
-        system_prompt = False  # doesnt need it apparently
-    else:
-        raise ValueError(f"Chat template name {chat_template_name} not found")
+    # if chat_template_name == "llama32":
+    #     chat_template = get_llama32_instruct_chat_template()
+    # elif chat_template_name == "phi":
+    #     chat_template = get_phi_cot_chat_template()
+    #     system_prompt = False
+    # elif chat_template_name == "qwen":
+    #     chat_template = get_qwen_chat_template()
+    #     system_prompt = False  # doesnt need it apparently
+    # else:
+    #     raise ValueError(f"Chat template name {chat_template_name} not found")
     
     def tokenize_function(examples):
         tokenized_texts = apply_chat_template_normal(
@@ -622,7 +579,7 @@ def apply_chat_template(ds: datasets.Dataset, tokenizer: AutoTokenizer, batch_si
             conversation=examples["text"],
             add_generation_prompt=False,
             return_assistant_tokens_mask=True,
-            chat_template=chat_template, # can change to base template
+            chat_template_name=chat_template_name, # can change to base template
             tokenize=True,
             # return_tensors="pt",
             # padding="longest",

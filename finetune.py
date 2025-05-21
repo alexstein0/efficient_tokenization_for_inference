@@ -200,6 +200,7 @@ def run_benchmark_loop(accelerator, model, config: Dict, step_no: str = None):
         # torch_random_seed=seed[2],
         # fewshot_random_seed=seed[3],
         # confirm_run_unsafe_code=confirm_run_unsafe_code,
+        confirm_run_unsafe_code=True,
         # **request_caching_args,
     )
     logger.debug(f"completed evaluation {accelerator.process_index}")
@@ -608,7 +609,7 @@ def main(args):
     logger.info(f"Loading model from {args.model}...")
     use_liger = args.use_liger and not args.model.lower().split("/")[-1].startswith("phi")
     if use_liger:
-        print("Using Liger")
+        logger.info("Using Liger")
         model = AutoLigerKernelForCausalLM.from_pretrained(
             args.model,
             torch_dtype=torch.bfloat16,

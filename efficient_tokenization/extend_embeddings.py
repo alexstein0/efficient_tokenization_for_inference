@@ -93,7 +93,7 @@ def initialize_new_embeddings(
     
     assert len(tokenizer) <= base_embeddings.shape[0], f"Tokenizer has {len(tokenizer)} tokens, but base embeddings have {base_embeddings.shape[0]} tokens"
     if logger is not None:
-        logger.info(f"Initializing {num_new_tokens} new embeddings for token range {new_token_range}", main_process_only=True)
+        logger.info(f"Initializing {num_new_tokens} new embeddings for token range {new_token_range} using strategy {init_strategy} {import_path if import_path is not None else ''}", main_process_only=True)
 
     output_embeddings = None
     if init_strategy == "default":

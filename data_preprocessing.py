@@ -1,6 +1,6 @@
 import logging
 
-from efficient_tokenization.tokenize_simple import my_tokenize, get_genqa_data, get_tokenizer, get_magpie_data, apply_chat_template, create_translation_dataset_with_template, get_gsm8k_data, get_mbpp_data
+from efficient_tokenization.tokenize_simple import my_tokenize, get_genqa_data, get_tokenizer, get_magpie_data, apply_chat_template, create_translation_dataset_with_template, get_gsm8k_data, get_mbpp_data, create_dictionary_dataset
 from datasets import load_from_disk, concatenate_datasets
 from transformers import AutoTokenizer
 import copy
@@ -9,7 +9,6 @@ import os
 import psutil
 import argparse
 from typing import List
-import numpy as np
 from chat_templating import visualize_loss_mask
 
 def setup_logging(log_level=logging.INFO):
@@ -35,6 +34,8 @@ def get_preprocessed_data(ds, args):
         ds = get_gsm8k_data(ds, track_role=True, batch_size=args.cpu_batch_size, threads=args.num_proc)
     elif args.raw_data_name == "mbpp":
         ds = get_mbpp_data(ds, track_role=True, batch_size=args.cpu_batch_size, threads=args.num_proc)
+    elif args.raw_data_name == "dictionary":
+        print("Dictionary data")
     else:
         raise ValueError(f"Unsupported raw data name: {args.raw_data_name}")
     return ds
@@ -185,6 +186,7 @@ def main(args):
             ds = ds.select(range(100))
         except:
             ds = ds["train"].select(range(100))
+        args.dictionary_total_samples = 100
     
     print(ds)
     ds = get_preprocessed_data(ds, args)
@@ -203,11 +205,18 @@ def main(args):
 
         print(visualize_loss_mask(ds_dict["translation"]["input_ids"][0], tokenizer, ds_dict["translation"]["loss_mask"][0]))
 
+    if "dictionary" in args.task and args.dict_ds_path is not None:
+        dict_ds = load_from_disk(args.dict_ds_path)
+        dict_ds = dict_ds.select(range(args.num_added_tokens))
+        ds_dict["dictionary"] = create_dictionary_dataset(dict_ds, base_tokenizer, tokenizer, args.dictionary_total_samples, args.min_words_per_sample, args.max_words_per_sample, args.chat_template_name)
+
     changed_dataset = False
-    final_ds_list = []
 
     for task_name in ds_dict:
-        dataset_path = os.path.join(args.save_dataset_dir, f"{args.raw_data_name}-{task_name}-{args.chat_template_name}-{args.save_dataset_name}")
+        task_str = f"{args.chat_template_name}-"
+        if task_name == "dictionary":
+            task_str += f"{args.dictionary_total_samples}samples-"
+        dataset_path = os.path.join(args.save_dataset_dir, f"{args.raw_data_name}-{task_str}{args.save_dataset_name}-{args.num_added_tokens}")
         if os.path.exists(dataset_path):
             logger.info(f"Dataset already exists, skipping: {dataset_path}")
             continue
@@ -264,11 +273,16 @@ if __name__ == "__main__":
     args.add_argument("--model", type=str,
                       default="meta-llama/Llama-3.2-1B")
     args.add_argument("--truncate", type=int)
-    args.add_argument("--dataset-path", type=str, default="emozilla/pg_books-tokenized-bos-eos-chunked-65536")
+    args.add_argument("--dataset-path", type=str)
     args.add_argument("--raw-data-name", type=str, default="genqa")
     args.add_argument("--num-proc", type=int, default=threads)
     args.add_argument("--save-dataset-name", type=str)
     args.add_argument("--save-dataset-dir", type=str, default="datasets")
+    args.add_argument("--dict-ds-path", type=str, default=None)
+    args.add_argument("--dictionary-total-samples", type=int, default=1000)
+    args.add_argument("--num-added-tokens", type=int, default=1000)
+    args.add_argument("--min-words-per-sample", type=int, default=5)
+    args.add_argument("--max-words-per-sample", type=int, default=15)
     args.add_argument("--tokenizer-path", type=str)
     args.add_argument("--pretokenizer-name", type=str)
     args.add_argument("--chat-template-name", type=str, default="llama32", choices=["llama32", "phi", "qwen"])
