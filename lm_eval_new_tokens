@@ -21,6 +21,7 @@ from lm_eval.__main__ import setup_parser, parse_eval_args
 from efficient_tokenization.benchmarking_utils import convert_results_into_new_token_metrics
 from transformers import AutoTokenizer
 
+os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
 def cli_evaluate_with_new_tokens(args: Union[argparse.Namespace, None] = None, extra_config_dict: dict = None) -> None:
     if not args:
