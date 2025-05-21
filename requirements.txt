@@ -141,7 +141,7 @@ pydantic==2.10.6
 pydantic-settings==2.9.1
 pydantic_core==2.27.2
 pydub==0.25.1
-pyg-lib==0.3.1+pt20cu117
+pyg-lib
 Pygments==2.18.0
 pynvml==11.5.0
 pyparsing==3.2.0
