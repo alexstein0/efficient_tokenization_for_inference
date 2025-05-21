@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
 import numpy as np
-from datasets import concatenate_datasets, load_from_disk, Dataset
+from datasets import concatenate_datasets, load_from_disk, Dataset, load_dataset
 import os
 
 
@@ -298,6 +298,14 @@ class MyPaddingCollatorGeneral:
         
         return batch
     
+def load_dataset_from_disk_or_hf(dataset_name: str, dataset_dir: str = "datasets", split: str = "train") -> Dataset:
+    try:
+        ds = load_from_disk(os.path.join(dataset_dir, dataset_name))
+    except:
+        ds = load_dataset(dataset_name, split=split)
+    return ds
+    
+    
 def load_mixed_dataset(dataset_name_list: List[str], dataset_dir: str = "datasets", task_list_split: str | None = None) -> Dataset:
     if task_list_split is None:
         print(f"WARNING: task_list_split is None, using uniform split")
@@ -315,7 +323,8 @@ def load_mixed_dataset(dataset_name_list: List[str], dataset_dir: str = "dataset
     assert sum(task_list_split) == 1
     dataset_list = []
     for i, dataset_name in enumerate(dataset_name_list):
-        dataset_list.append(load_from_disk(os.path.join(dataset_dir, dataset_name)))
+        ds = load_dataset_from_disk_or_hf(dataset_name, dataset_dir, split="train")
+        dataset_list.append(ds)
         if i == 0:
             num_samples = dataset_list[0].num_rows
         else:

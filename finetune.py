@@ -42,7 +42,8 @@ from efficient_tokenization.data_utils import (
     MyPaddingCollatorWithLossMask, 
     MyPaddingCollatorGeneral, 
     create_memory_efficient_loader, 
-    load_mixed_dataset
+    load_mixed_dataset,
+    load_dataset_from_disk_or_hf
 )
 
 from efficient_tokenization.utils import setup_logging, check_disk_space, generate_hashed_dir_name, get_cpus, parse_args, get_latest_checkpoint
@@ -749,7 +750,7 @@ def main(args):
     if len(dataset_list) > 1:
         ds = load_mixed_dataset(dataset_list, dataset_dir=args.dataset_dir, task_list_split=args.task_list_split)
     else:
-        ds = load_from_disk(os.path.join(args.dataset_dir, dataset_str))
+        ds = load_dataset_from_disk_or_hf(dataset_name=dataset_str, dataset_dir=args.dataset_dir)
     ds = ds.train_test_split(test_size=0.1) # Split the dataset into train (90%) and validation (10%)
 
     train_loader, train_sampler = create_memory_efficient_loader(
