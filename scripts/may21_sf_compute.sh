@@ -20,4 +20,21 @@
 # (LOGIN WANDB)
 
 # run:
-accelerate launch --num_processes 8 finetune.py --run-lm-eval --limit 100 --dry-run --total-batch-size 32 --max-train-steps 1000    --batch-size 8 --eval-batch-size 8 --eval-steps 50  --eval-iters 128 --benchmark-steps 100 --learning-rate 2e-5 --warmup-steps 100 --checkpointing-steps 100    --wandb efficient_tokenization  --dataset magpie-default-tokenized_1000    --task-name mixed    --wandb-tags mixed,baseline,full,new_runs,mbpp   --tokenizer-path  tomg-group-umd/EIM-tokenizer-llama3.2-magpie-100    --num-new-tokens 1000 --experiment-name sf  --benchmark-tasks ifeval  --log-samples --model meta-llama/Llama-3.2-3B --finetune-params full --lr-schedule cosine  --save-results 3
+# accelerate launch --num_processes 8 finetune.py --dry-run \
+#     --max-train-steps 1000  --total-batch-size 32 --batch-size 8 --eval-batch-size 8 \
+#     --learning-rate 2e-5 --lr-schedule cosine --warmup-steps 100 \
+#     --dataset magpie-default-tokenized_1000 --model meta-llama/Llama-3.2-3B --finetune-params full   --embedding-init-strategy merge --task-name mixed \
+#     --tokenizer-path  tomg-group-umd/EIM-tokenizer-llama3.2-magpie-100    --num-new-tokens 1000 \
+#     --eval-steps 50  --eval-iters 128 \
+#     --run-lm-eval --benchmark-steps 100 --limit 100 --benchmark-tasks ifeval  --log-samples --save-results 3 \
+#     --experiment-name sf  --checkpointing-steps 100    --wandb efficient_tokenization  --wandb-tags mixed,baseline,full,new_runs,mbpp
+
+accelerate launch --num_processes 8 finetune.py --dry-run \
+    --max-train-steps 1000  --total-batch-size 32 --batch-size 8 --eval-batch-size 8 \
+    --learning-rate 2e-5 --lr-schedule cosine --warmup-steps 100 \
+    --dataset  tomg-group-umd/Efficient_inference_models-Llama32-magpie-default --model meta-llama/Llama-3.2-3B --finetune-params full   --embedding-init-strategy merge --task-name mixed \
+    --tokenizer-path  meta-llama/Llama-3.2-3B    --num-new-tokens 0 \
+    --eval-steps 50  --eval-iters 128 \
+    --run-lm-eval --benchmark-steps 100 --limit 100 --benchmark-tasks ifeval  --log-samples --save-results 3 \
+    --experiment-name sf  --checkpointing-steps 100    --wandb efficient_tokenization  --wandb-tags mixed,baseline,full,magpie
+    

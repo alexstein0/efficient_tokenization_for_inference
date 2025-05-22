@@ -61,8 +61,9 @@ from efficient_tokenization.model_utils import (
 from efficient_tokenization.benchmarking_utils import get_lm_eval_string, convert_results_into_new_token_metrics
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 
-from lm_eval_harness.lm_eval import evaluator, utils, models
-from lm_eval_harness.lm_eval.tasks import TaskManager
+
+sys.path.insert(0, os.path.abspath("lm_evaluation_harness"))
+from lm_eval import evaluator, utils, models, tasks
 
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
@@ -149,7 +150,7 @@ def run_benchmark_loop(accelerator, model, config: Dict, step_no: str = None):
     # default_seed_string = "0,1234,1234,1234"
 
     task_list = config["benchmark_tasks"]
-    task_manager = TaskManager()
+    task_manager = tasks.TaskManager()
     task_names = task_manager.match_tasks(task_list)
     for task in [task for task in task_list if task not in task_names]:
         if os.path.isfile(task):
@@ -750,7 +751,6 @@ def main(args):
         ds = load_mixed_dataset(dataset_list, dataset_dir=args.dataset_dir, task_list_split=args.task_list_split)
     else:
         ds = load_dataset_from_disk_or_hf(dataset_name=dataset_str, dataset_dir=args.dataset_dir)
-    ds = ds.train_test_split(test_size=0.1) # Split the dataset into train (90%) and validation (10%)
 
     train_loader, train_sampler = create_memory_efficient_loader(
         ds["train"],

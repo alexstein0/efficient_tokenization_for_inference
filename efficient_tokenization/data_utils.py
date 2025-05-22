@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
 import numpy as np
-from datasets import concatenate_datasets, load_from_disk, Dataset, load_dataset
+from datasets import concatenate_datasets, load_from_disk, Dataset, load_dataset, DatasetDict
+from collections import defaultdict
 import os
 
 
@@ -298,15 +299,19 @@ class MyPaddingCollatorGeneral:
         
         return batch
     
-def load_dataset_from_disk_or_hf(dataset_name: str, dataset_dir: str = "datasets", split: str = "train") -> Dataset:
+def load_dataset_from_disk_or_hf(dataset_name: str, dataset_dir: str = "datasets") -> DatasetDict | Dataset:
     try:
         ds = load_from_disk(os.path.join(dataset_dir, dataset_name))
     except:
-        ds = load_dataset(dataset_name, split=split)
-    return ds
+        ds = load_dataset(dataset_name)
+    
+    if isinstance(ds, DatasetDict):
+        return ds
+    else:
+        return ds.train_test_split(test_size=0.1)
     
     
-def load_mixed_dataset(dataset_name_list: List[str], dataset_dir: str = "datasets", task_list_split: str | None = None) -> Dataset:
+def load_mixed_dataset(dataset_name_list: List[str], dataset_dir: str = "datasets", task_list_split: str | None = None) -> DatasetDict:
     if task_list_split is None:
         print(f"WARNING: task_list_split is None, using uniform split")
         task_list_split = [1.0/len(dataset_name_list) for _ in dataset_name_list]
@@ -321,39 +326,38 @@ def load_mixed_dataset(dataset_name_list: List[str], dataset_dir: str = "dataset
 
     assert len(dataset_name_list) == len(task_list_split)
     assert sum(task_list_split) == 1
-    dataset_list = []
+    dataset_list = defaultdict(list)
+    lengths = {}
     for i, dataset_name in enumerate(dataset_name_list):
-        ds = load_dataset_from_disk_or_hf(dataset_name, dataset_dir, split="train")
-        dataset_list.append(ds)
-        if i == 0:
-            num_samples = dataset_list[0].num_rows
-        else:
-            assert dataset_list[i].num_rows == num_samples, f"All datasets must have the same number of samples, but {dataset_list[i].num_rows} != {num_samples} for dataset {dataset_name}"
-    
-    # Create random values between 0 and 1
-    dist = np.random.random(num_samples)
-    mixed_ds_list = []
-    # Calculate cumulative percentages for proper binning
-    cum_pcts = np.cumsum([0] + task_list_split)
+        ds = load_dataset_from_disk_or_hf(dataset_name, dataset_dir)
         
-    # Assign each random value to a bin
-    for i in range(len(task_list_split)):
-        # Select indices where random values fall between current and next cumulative percentage
-        idx = np.where((dist >= cum_pcts[i]) & (dist < cum_pcts[i+1]))[0]
-        mixed_ds_list.append(dataset_list[i].select(idx))
+        for split in ds.keys():
+            # separates for each train and test split
+            dataset_list[split].append(ds[split])
 
+            num_samples = ds[split].num_rows
+            if i == 0:
+                # TODO this doesnt work for datasets of different sizes (such as dictionary datasets)
+                lengths[split] = num_samples
+            else:
+                assert lengths[split] == num_samples, f"All datasets must have the same number of samples, but {lengths[split]} != {num_samples} for dataset {dataset_name} split {split}"
+    
+    ds_dict = {}
+    for split in dataset_list.keys():
+        # Create random values between 0 and 1
+        dist = np.random.random(lengths[split])
+        mixed_ds_list = []
+        # Calculate cumulative percentages for proper binning
+        cum_pcts = np.cumsum([0] + task_list_split)
+        
+        # Assign each random value to a bin
+        for i in range(len(task_list_split)):
+            # Select indices where random values fall between current and next cumulative percentage
+            idx = np.where((dist >= cum_pcts[i]) & (dist < cum_pcts[i+1]))[0]
+            mixed_ds_list.append(dataset_list[split][i].select(idx))
 
-    # assert len(ds) == num_samples, f"All samples accounted for"
-    # all_ids = []
-    # for ds_i in ids_from_each_ds:
-    #     all_ids.extend(ds_i)
-    # a = list(set(all_ids))
-    # a.sort()
-    # b = list(range(num_samples))
-    # assert a == b, f"All dataset rows are represented {a} != {b}"
-
-    ds = concatenate_datasets(mixed_ds_list)
-    return ds
+        ds_dict[split] = concatenate_datasets(mixed_ds_list)
+    return ds_dict
 
 
 def create_memory_efficient_loader(dataset, batch_size, collate_fn, num_proc, shuffle=True):

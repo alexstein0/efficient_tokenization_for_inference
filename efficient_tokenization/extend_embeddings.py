@@ -85,7 +85,7 @@ def initialize_new_embeddings(
     dtype = base_embeddings.dtype
     embed_dim = base_embeddings.shape[1]
     new_vocab_size = len(tokenizer)
-    new_token_start = new_vocab_size - num_new_tokens
+    new_token_start = new_vocab_size - num_new_tokens  # this is the new token start in the VOCAB note that the merges might not map to the vocab 1 to 1
     new_token_range = slice(new_token_start, new_vocab_size)
     old_token_range = slice(0, new_token_start)
 
@@ -136,7 +136,7 @@ def initialize_new_embeddings(
         new_embeddings = torch.zeros(num_new_tokens, embed_dim, device=device, dtype=dtype)
 
         tokenizer_json = json.loads(tokenizer._tokenizer.to_str())
-        new_merge_list = tokenizer_json["model"]["merges"][new_token_start:]
+        new_merge_list = tokenizer_json["model"]["merges"][-num_new_tokens:]  # this needs to get the last x merges bc that doesnt correspond to the new tokens for sure
         for i, (first, second) in enumerate(new_merge_list):
             first_id = tokenizer.convert_tokens_to_ids(first)
             second_id = tokenizer.convert_tokens_to_ids(second)
