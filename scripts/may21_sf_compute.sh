@@ -32,7 +32,7 @@
 
 accelerate launch --num_processes 8 --num_machines 1 --dynamo_backend no --mixed_precision bf16 \
     finetune.py --dry-run \
-    --max-train-steps 1000  --total-batch-size 32 --batch-size 8 --eval-batch-size 8 \
+    --max-train-steps 1000  --total-batch-size 64 --batch-size 8 --eval-batch-size 8 \
     --learning-rate 2e-5 --lr-schedule cosine --warmup-steps 100 \
     --dataset  tomg-group-umd/EIM-dataset-Llama32-magpie-default_0 --model meta-llama/Llama-3.2-3B --finetune-params full   --embedding-init-strategy merge --task-name mixed \
     --tokenizer-path  meta-llama/Llama-3.2-3B-Instruct    --num-new-tokens 0 \

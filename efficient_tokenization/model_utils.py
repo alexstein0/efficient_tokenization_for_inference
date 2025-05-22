@@ -10,7 +10,7 @@ def calc_batch_size_stuff(total_batch_size: int = None, batch_size: int = None, 
         total_batch_size = total_batch_size
         if batch_size is not None:
             batch_size = batch_size
-            gradient_accumulate_every = total_batch_size // (batch_size * num_processes)
+            gradient_accumulate_every = min(1, total_batch_size // (batch_size * num_processes))
         elif gradient_accumulate_every is not None:
             gradient_accumulate_every = gradient_accumulate_every
             batch_size = total_batch_size // (gradient_accumulation_steps * num_processes)
